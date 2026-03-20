@@ -1,0 +1,12 @@
+google-genai
+tqdm
+pyyaml
+requests
+matplotlib
+numpy
+scipy
+pandas
+huggingface_hub
+python-dotenv
+pypdf
+
