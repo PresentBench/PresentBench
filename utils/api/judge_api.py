@@ -36,6 +36,8 @@ class JudgeAPI:
         material_objs: Optional[List[Any]] = None,
         material_paths: Optional[List[str]] = None,
         thinking_level: Optional[str] = None,
+        temperature: Optional[float] = None,
+        seed: Optional[int] = None,
         **kwargs
     ) -> tuple[Optional[str], Optional[dict]]:
         """
@@ -51,6 +53,10 @@ class JudgeAPI:
             material_objs: List of material file objects (for Gemini API).
             material_paths: List of material file paths (for OpenAI-like API).
             thinking_level: Thinking level (Gemini API only).
+            temperature: Sampling temperature (optional). Set to 0 for
+                deterministic / reproducible judge verdicts. Forwarded to
+                every backend that supports it.
+            seed: Random seed (optional). Forwarded to backends that support it.
             **kwargs: Other optional parameters.
             
         Returns:
@@ -58,6 +64,14 @@ class JudgeAPI:
             - response_text: Text content from the API response.
             - response_json_dict: Raw JSON dict (used for billing/usage tracking).
         """
+        # Merge fixed-decoding options into kwargs so they flow through to
+        # whichever backend is in use (only when explicitly provided; leaving
+        # both as None reproduces the previous server-default decoding).
+        if temperature is not None:
+            kwargs["temperature"] = temperature
+        if seed is not None:
+            kwargs["seed"] = seed
+
         if self._is_gemini_api:
             # Gemini API: use file objects and a contents list.
             contents = []

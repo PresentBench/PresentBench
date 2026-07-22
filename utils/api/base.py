@@ -1,9 +1,35 @@
-from abc import ABC, abstractmethod
 import logging
+from abc import ABC, abstractmethod
+
 import requests
 from google import genai
-from utils.encode_file import encode_file_base64, read_file_bytes
 
+from utils.encode_file import get_mime_type, read_file_bytes, build_file_data_url
+
+
+logger = logging.getLogger(__name__)
+
+
+def _build_gemini_config(thinking_level=None, temperature=None, seed=None):
+    """Build a ``GenerateContentConfig`` for the google-genai SDK.
+
+    Only fields that are explicitly provided are included, so the default
+    behaviour (``thinking_level=temperature=seed=None``) reproduces the
+    previous "server-default decoding" and returns ``None`` (no config).
+
+    Fixing ``temperature=0`` (optionally with a ``seed``) makes the judge's
+    per-item verdicts as deterministic / reproducible as the backend allows.
+    """
+    config_kwargs = {}
+    if thinking_level:
+        config_kwargs["thinking_config"] = genai.types.ThinkingConfig(
+            thinking_level=thinking_level
+        )
+    if temperature is not None:
+        config_kwargs["temperature"] = temperature
+    if seed is not None:
+        config_kwargs["seed"] = seed
+    return genai.types.GenerateContentConfig(**config_kwargs) if config_kwargs else None
 
 
 class BaseAPI(ABC):
@@ -59,7 +85,9 @@ class GeminiAPI(BaseAPI):
             # Avoid exceptions in __del__ interfering with interpreter teardown.
             pass
     
-    def generate_content(self, model: str, prompt: str, contents: list = None, thinking_level: str = None, **kwargs):
+    def generate_content(self, model: str, prompt: str, contents: list = None,
+                         thinking_level: str = None, temperature: float | None = None,
+                         seed: int | None = None, **kwargs):
         """Generate content using the Gemini API.
         
         Args:
@@ -67,27 +95,22 @@ class GeminiAPI(BaseAPI):
             prompt: Prompt text.
             contents: Optional list of contents.
             thinking_level: Optional thinking level.
+            temperature: Optional temperature.
+            seed: Optional seed.
+            **kwargs: Other optional parameters.
         """
         contents = contents or []
         
         try:
-            if not thinking_level:
-                response = self.client.models.generate_content(
-                    model=model,
-                    contents=contents + [prompt],
-                )
-            else:
-                response = self.client.models.generate_content(
-                    model=model,
-                    contents=contents + [prompt],
-                    config=genai.types.GenerateContentConfig(
-                        thinking_config=genai.types.ThinkingConfig(thinking_level=thinking_level)
-                    ),
-                )
-            
+            config = _build_gemini_config(thinking_level, temperature, seed)
+            response = self.client.models.generate_content(
+                model=model,
+                contents=contents + [prompt],
+                config=config,
+            )
             return response.text, dict(response)
         except Exception as e:
-            logging.error(f"Gemini API call failed: {str(e)}")
+            logger.error(f"Gemini API call failed: {str(e)}")
             return None, None
     
 
@@ -95,22 +118,19 @@ class GeminiInlineAPI(BaseAPI):
     
     def __init__(self, *args, **kwargs):
         self.client = genai.Client(*args, **kwargs)
-    
+
     def upload_file(self, file_path: str):
         """Return a Gemini file part object (inline bytes)."""
-        if file_path.endswith('.pdf'):
-            mime_type = 'application/pdf'
-        elif file_path.endswith('.md') or file_path.endswith('.txt'):
-            mime_type = 'text/plain'
-        else:
-            raise ValueError(f"Unsupported file type: {file_path}")
+        mime_type = get_mime_type(file_path)
 
-        return genai.types.Part.from_bytes(
-            data=read_file_bytes(file_path),
+        return genai.types.Blob(
             mime_type=mime_type,
+            data=read_file_bytes(file_path),
         )
-    
-    def generate_content(self, model: str, prompt: str, contents: list = None, thinking_level: str = None, **kwargs):
+
+    def generate_content(self, model: str, prompt: str, contents: list = None,
+                         thinking_level: str = None, temperature: float | None = None,
+                         seed: int | None = None, **kwargs):
         """Generate content using the Gemini API.
         
         Args:
@@ -118,29 +138,28 @@ class GeminiInlineAPI(BaseAPI):
             prompt: Prompt text.
             contents: Optional list of contents.
             thinking_level: Optional thinking level.
+            temperature: Optional temperature.
+            seed: Optional seed.
         """
-        contents = contents or []
-        
+        parts = [
+            genai.types.Part(inline_data=item)
+            for item in (contents or [])
+        ]
+        parts.append(genai.types.Part(text=prompt))
+
+        config = _build_gemini_config(thinking_level, temperature, seed)
+
         try:
-            if not thinking_level:
-                response = self.client.models.generate_content(
-                    model=model,
-                    contents=contents + [prompt],
-                )
-            else:
-                response = self.client.models.generate_content(
-                    model=model,
-                    contents=contents + [prompt],
-                    config=genai.types.GenerateContentConfig(
-                        thinking_config=genai.types.ThinkingConfig(thinking_level=thinking_level)
-                    ),
-                )
-            
+            response = self.client.models.generate_content(
+                model=model,
+                contents=[genai.types.Content(parts=parts)],
+                config=config,
+            )
             return response.text, dict(response)
         except Exception as e:
-            logging.error(f"Gemini API call failed: {str(e)}")
+            logger.error(f"Gemini API call failed: {str(e)}")
             return None, None
-    
+
 
 
 class OpenAIAPI(BaseAPI):
@@ -163,6 +182,85 @@ class OpenAIAPI(BaseAPI):
         """OpenAI API does not require uploading; return the file path."""
         return file_path
 
+    @staticmethod
+    def _extract_output_text(result: dict) -> str:
+        """Extract all plain-text output from an OpenAI Responses API JSON response.
+
+        This strictly follows the official documentation at
+        https://developers.openai.com/api/reference/resources/responses/methods/create
+        and handles every possible item type in the ``output`` array. All fields
+        containing plain text are extracted and joined into a single string using
+        readable section delimiters:
+
+        - ``message``: ``content[].output_text.text`` / ``content[].refusal.refusal``
+        - ``reasoning``: ``summary[].text`` / ``content[].text``
+
+        Non-plain-text content such as ``compaction`` (encrypted) and
+        ``image_generation_call`` (base64-encoded images) is skipped.
+        """
+        if not isinstance(result, dict):
+            return ''
+
+        segments: list[str] = []
+
+        def _section(header: str, body: str) -> None:
+            body = body.strip('\n')
+            if body:
+                segments.append(f"--- {header} ---\n{body}")
+
+        def _as_text_from_content_list(content) -> str:
+            """Join an ``output_text`` array into plain text."""
+            if isinstance(content, str):
+                return content
+            if not isinstance(content, list):
+                return ''
+            parts: list[str] = []
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get('type') in ('output_text', 'text'):
+                    t = part.get('text')
+                    if isinstance(t, str) and t:
+                        parts.append(t)
+                elif part.get('type') == 'refusal':
+                    r = part.get('refusal')
+                    if isinstance(r, str) and r:
+                        parts.append(f"[refusal] {r}")
+            return '\n'.join(parts)
+
+        output = result.get('output') or []
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            itype = item.get('type')
+
+            if itype == 'message':
+                text = _as_text_from_content_list(item.get('content'))
+                _section('message', text)
+
+            elif itype == 'reasoning':
+                parts: list[str] = []
+                for s in (item.get('summary') or []):
+                    if isinstance(s, dict) and s.get('type') == 'summary_text':
+                        t = s.get('text')
+                        if isinstance(t, str) and t:
+                            parts.append(f"[summary] {t}")
+                for c in (item.get('content') or []):
+                    if isinstance(c, dict) and c.get('type') == 'reasoning_text':
+                        t = c.get('text')
+                        if isinstance(t, str) and t:
+                            parts.append(t)
+                _section('reasoning', '\n'.join(parts))
+
+        if segments:
+            return '\n\n'.join(segments)
+
+        # Fallback: support the top-level ``output_text`` field returned by some proxies
+        if isinstance(top_level := result.get('output_text'), str):
+            return top_level
+
+        return ''
+
     def generate_content(self, model: str, prompt: str, file_paths: list = None, **kwargs):
         """
         Call the OpenAI Response API.
@@ -181,7 +279,7 @@ class OpenAIAPI(BaseAPI):
             content_list.append({
                 "type": "input_file",
                 "filename": file_path,
-                "file_data": f"data:application/pdf;base64,{encode_file_base64(file_path)}"
+                "file_data": build_file_data_url(file_path),
             })
         
         # Add the text prompt.
@@ -200,6 +298,8 @@ class OpenAIAPI(BaseAPI):
             ],
             "stream": False
         }
+        if kwargs.get("temperature") is not None:
+            data["temperature"] = kwargs["temperature"]
         
         try:
             # Reuse connections via session.
@@ -208,13 +308,12 @@ class OpenAIAPI(BaseAPI):
 
             # Extract text content from the response.
             result = response.json()
-            text = result.get('output', [{}])[0].get('content', [{}])[0].get('text', '')
-            
+            text = self._extract_output_text(result)
+
             return text, result
         except requests.exceptions.RequestException as e:
-            logging.error(f"OpenAI API request failed: {str(e)}")
+            logger.error(f"OpenAI API request failed: {str(e)}")
             return None, None
         except Exception as e:
-            logging.error(f"OpenAI API call failed: {str(e)}")
+            logger.error(f"OpenAI API call failed: {str(e)}")
             return None, None
-

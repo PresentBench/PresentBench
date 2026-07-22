@@ -276,8 +276,13 @@ def _convert_with_libreoffice(pptx_path: Path, pdf_path: Optional[Path]) -> Opti
         # --headless: Run without GUI
         # --convert-to pdf: Convert to PDF
         # --outdir: Output directory (temporary directory)
+        # -env:UserInstallation: Use a dedicated user profile per call so that
+        #   concurrent invocations don't fight for the default ~/.config/libreoffice lock.
+        user_profile_dir = temp_dir_path / 'lo_profile'
+        user_profile_dir.mkdir(parents=True, exist_ok=True)
         cmd = [
             'libreoffice',
+            f'-env:UserInstallation=file://{user_profile_dir}',
             '--headless',
             '--convert-to', 'pdf',
             '--outdir', str(temp_dir_path),
@@ -289,7 +294,8 @@ def _convert_with_libreoffice(pptx_path: Path, pdf_path: Optional[Path]) -> Opti
                 cmd,
                 capture_output=True,
                 text=True,
-                check=True
+                check=True,
+                timeout=300,
             )
             
             # LibreOffice creates PDF in the temp directory with the same name as input

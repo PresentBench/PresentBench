@@ -13,27 +13,52 @@ from datetime import datetime
 from utils.generate_checklist import generate_checklist
 
 
+logger = logging.getLogger(__name__)
 
-def find_resume_yaml(output_dir: str, filename_prefix: str, min_timestamp: Optional[datetime] = None) -> Optional[str]:
+
+
+def find_resume_yaml(
+    output_dir: str,
+    filename_prefix: str,
+    min_timestamp: Optional[datetime] = None,
+    extra_prefixes: Optional[List[str]] = None,
+) -> Optional[str]:
     """
     Find a historical result YAML in output_dir that can be used for resuming.
 
     Rules:
-    - File name starts with filename_prefix and ends with .yaml
+    - File name starts with filename_prefix (or any prefix in extra_prefixes) and ends with .yaml
     - Exclude *_score.yaml
     - Parse timestamp from file name (format: YYYY-MM-DD_HH-MM-SS)
     - If min_timestamp is provided, result files with timestamps older than this time will be skipped.
-    - If multiple candidates exist, pick the newest by timestamp
+    - If multiple candidates exist, pick the newest by timestamp across all allowed prefixes.
+    
+    Args:
+        output_dir: Directory to search.
+        filename_prefix: Primary file-name prefix (usually the current model's prefix).
+        min_timestamp: Optional minimum timestamp filter.
+        extra_prefixes: Additional file-name prefixes that are also acceptable as
+            resume sources. Typical use: allow a model to resume from alias models
+            that are known to refer to the same underlying judge model
+            (e.g. ``GPT-5-Mini_`` and ``api_azure_openai_gpt-5-mini_``).
     """
     if not output_dir or not os.path.isdir(output_dir):
         return None
+
+    # Build the full list of acceptable prefixes. The primary one is always first,
+    # so that in case of tie (identical timestamp) it wins deterministically.
+    allowed_prefixes: List[str] = [filename_prefix]
+    if extra_prefixes:
+        for p in extra_prefixes:
+            if p and p not in allowed_prefixes:
+                allowed_prefixes.append(p)
 
     candidates: List[tuple[str, datetime]] = []  # (file_path, parsed_timestamp)
     timestamp_pattern = re.compile(r'(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})')
     
     try:
         for name in os.listdir(output_dir):
-            if not name.startswith(filename_prefix):
+            if not any(name.startswith(p) for p in allowed_prefixes):
                 continue
             if not name.endswith(".yaml"):
                 continue
@@ -139,14 +164,14 @@ def load_judge_prompt(prompt_path: str, common_judge_prompt_path: str, slides_pa
                     return functools.partial(fn, *args, **kwargs)
                 except Exception as e:
                     msg = f"Failed to decode partial {x}: {e}"
-                    logging.warning(msg)
+                    logger.warning(msg)
                     return _stub_callable(msg)
             if t == "callable":
                 try:
                     return _import_from_qualname(str(x.get("callable") or ""))
                 except Exception as e:
                     msg = f"Failed to decode callable {x}: {e}"
-                    logging.warning(msg)
+                    logger.warning(msg)
                     return _stub_callable(msg)
             # Plain dict: recursively decode values.
             return {k: _decode_obj(v) for k, v in x.items()}
@@ -211,7 +236,7 @@ def load_existing_results(resume_yaml_path: str) -> Optional[dict]:
             data = yaml.safe_load(f)
         return data if isinstance(data, dict) else None
     except Exception as e:
-        logging.warning(f"Failed to load resume YAML {resume_yaml_path}: {e}")
+        logger.warning(f"Failed to load resume YAML {resume_yaml_path}: {e}")
         return None
 
 

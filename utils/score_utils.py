@@ -12,8 +12,9 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 # Score file pattern.
 SCORE_FILE_PATTERN = re.compile(
@@ -107,43 +108,79 @@ def discover_subset_item_rel_paths(base_dir: Path) -> List[Path]:
     return sorted(item_dirs, key=lambda p: str(p).replace("\\", "/"))
 
 
-def find_all_score_yamls(results_dir: Path, judge_model: str | None = None) -> List[Path]:
+def find_all_score_yamls(
+    results_dir: Path,
+    judge_model: str | None = None,
+    min_timestamp: Optional[datetime] = None,
+    extra_judge_models: Optional[List[str]] = None,
+) -> List[Path]:
     """
     Find all files in results_dir matching {judge_model}_{timestamp}_score.yaml.
     
     Args:
         results_dir: Results directory.
         judge_model: Optional judge model name; if provided, only return matching files.
+        min_timestamp: If provided, score files with timestamps older than this time will be skipped.
+        extra_judge_models: Additional judge model names that are also considered a
+            match. Useful for allowing a model to reuse score files produced by an
+            alias model that refers to the same underlying judge model
+            (e.g. ``GPT-5-Mini`` and ``api_azure_openai_gpt-5-mini``).
     
     Returns:
         Matching files, sorted by file name.
     """
+    # Build the set of acceptable judge-model names.
+    allowed_models: Optional[set[str]] = None
+    if judge_model is not None:
+        allowed_models = {judge_model}
+        if extra_judge_models:
+            allowed_models.update(m for m in extra_judge_models if m)
+
     matches: List[Path] = []
     for p in results_dir.glob("*_score.yaml"):
         if m := SCORE_FILE_PATTERN.match(p.name):
-            # If judge_model is specified, it must match.
-            if judge_model is not None:
-                if m.group("judge_model") == judge_model:
-                    matches.append(p)
-            else:
-                # If judge_model is not specified, keep all matches.
-                matches.append(p)
+            # If judge_model is specified, it must match (including aliases).
+            if allowed_models is not None and m.group("judge_model") not in allowed_models:
+                continue
+            # If min_timestamp is provided, filter by timestamp.
+            if min_timestamp is not None:
+                try:
+                    file_ts = datetime.strptime(m.group("ts"), "%Y-%m-%d_%H-%M-%S")
+                    if file_ts < min_timestamp:
+                        continue
+                except (ValueError, TypeError):
+                    continue  # Cannot parse timestamp -> skip.
+            matches.append(p)
     return sorted(matches)
 
 
-def find_single_score_yaml(results_dir: Path, prefer_newest: bool, judge_model: str | None = None) -> Path | None:
+def find_single_score_yaml(
+    results_dir: Path,
+    judge_model: str | None = None,
+    min_timestamp: Optional[datetime] = None,
+    prefer_newest: bool = True,
+    extra_judge_models: Optional[List[str]] = None,
+) -> Path | None:
     """
     Find a single {judge_model}_{timestamp}_score.yaml file in results_dir.
     
     Args:
         results_dir: Results directory.
-        prefer_newest: If multiple files exist, True selects newest, False selects oldest.
+        prefer_newest: If multiple files exist, True selects newest, False selects oldest. Defaults to True.
         judge_model: Optional judge model name; if provided, only consider matching files.
+        min_timestamp: If provided, score files with timestamps older than this time will be skipped.
+        extra_judge_models: Additional judge model names that are also accepted as
+            resume sources (aliases).
     
     Returns:
         File path if found, otherwise None. If multiple files exist, choose newest/oldest based on prefer_newest.
     """
-    matches = find_all_score_yamls(results_dir, judge_model=judge_model)
+    matches = find_all_score_yamls(
+        results_dir,
+        judge_model=judge_model,
+        min_timestamp=min_timestamp,
+        extra_judge_models=extra_judge_models,
+    )
     if len(matches) == 0:
         return None
     
@@ -153,9 +190,8 @@ def find_single_score_yaml(results_dir: Path, prefer_newest: bool, judge_model: 
     # If multiple files exist, pick newest/oldest by timestamp.
     # Extract timestamp from: {judge_model}_{timestamp}_score.yaml
     def extract_timestamp(path: Path) -> str:
-        m = SCORE_FILE_PATTERN.match(path.name)
-        if m:
-            return m.group("ts")
+        if match := SCORE_FILE_PATTERN.match(path.name):
+            return match.group("ts")
         return ""
     
     # Sort by timestamp (format: YYYY-MM-DD_HH-MM-SS).
@@ -183,10 +219,10 @@ def find_all_score_jsons(results_dir: Path, judge_model: str | None = None) -> L
     for p in results_dir.iterdir():
         if not p.is_file():
             continue
-        if m := JSON_SCORE_FILE_PATTERN.match(p.name):
+        if match := JSON_SCORE_FILE_PATTERN.match(p.name):
             # If judge_model is specified, it must match.
             if judge_model is not None:
-                if m.group("judge_model") == judge_model:
+                if match.group("judge_model") == judge_model:
                     matches.append(p)
             else:
                 # If judge_model is not specified, keep all matches.

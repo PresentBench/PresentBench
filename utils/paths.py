@@ -59,6 +59,7 @@ DATA_SOURCE_DIRS_REL = [
 
 DATA_SOURCE_DIRS_REL = [Path(rel) for rel in DATA_SOURCE_DIRS_REL]
 
+SKIP_NAMES = {"__pycache__"}
 
 def get_data_source_dirs(base_dir: PathLike | None = None) -> list[Path]:
     """
