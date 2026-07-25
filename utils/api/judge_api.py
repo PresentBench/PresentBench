@@ -86,6 +86,7 @@ class JudgeAPI:
                 model=model,
                 prompt=prompt,
                 file_paths=file_paths,
+                thinking_level=thinking_level,
                 **kwargs
             )
 

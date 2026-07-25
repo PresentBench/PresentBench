@@ -185,8 +185,8 @@ def run_once(
             )
 
             root_logger = logging.getLogger()
+            previous_level = root_logger.level
             root_logger.setLevel(logging.INFO)
-            root_logger.handlers.clear()
             root_logger.addHandler(log_handler)
 
             import sys
@@ -210,6 +210,7 @@ def run_once(
                 if added_to_syspath and data_root_str in sys.path:
                     sys.path.remove(data_root_str)
                 root_logger.removeHandler(log_handler)
+                root_logger.setLevel(previous_level)
                 log_handler.close()
         
         # material and judge_prompt are taken from the data item directory.

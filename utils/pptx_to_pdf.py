@@ -278,6 +278,8 @@ def _convert_with_libreoffice(pptx_path: Path, pdf_path: Optional[Path]) -> Opti
     try:
         temp_dir = tempfile.mkdtemp(prefix='pptx_to_pdf_')
         temp_dir_path = Path(temp_dir)
+        user_profile_dir = temp_dir_path / 'lo_profile'
+        user_profile_dir.mkdir(parents=True, exist_ok=True)
         
         # LibreOffice command
         # --headless: Run without GUI
@@ -285,6 +287,7 @@ def _convert_with_libreoffice(pptx_path: Path, pdf_path: Optional[Path]) -> Opti
         # --outdir: Output directory (temporary directory)
         cmd = [
             libreoffice_cmd,
+            f'-env:UserInstallation={user_profile_dir.resolve().as_uri()}',
             '--headless',
             '--convert-to', 'pdf',
             '--outdir', str(temp_dir_path),
@@ -296,7 +299,8 @@ def _convert_with_libreoffice(pptx_path: Path, pdf_path: Optional[Path]) -> Opti
                 cmd,
                 capture_output=True,
                 text=True,
-                check=True
+                check=True,
+                timeout=300,
             )
             
             # LibreOffice creates PDF in the temp directory with the same name as input
@@ -320,6 +324,9 @@ def _convert_with_libreoffice(pptx_path: Path, pdf_path: Optional[Path]) -> Opti
             logger.error(f"  Return code: {e.returncode}")
             logger.error(f"  stdout: {e.stdout}")
             logger.error(f"  stderr: {e.stderr}")
+            return None
+        except subprocess.TimeoutExpired:
+            logger.error(f"pptx-to-pdf conversion timed out after 300 seconds: {pptx_path}")
             return None
         except Exception as e:
             logger.error(f"pptx-to-pdf conversion failed with unexpected error: {e}")

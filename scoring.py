@@ -98,23 +98,19 @@ def score_section(
         for item_id, item in cls_answers.items():
             if not isinstance(item, dict):
                 continue
+            # 保持历史评分口径：每个有效条目字典都计入分母，未回答或 NA 只是不计入分子。
+            valid_count += 1
             raw_ans = item.get("answer")
-            if raw_ans is None:
-                # API 调用失败：无 answer 视为不计
-                continue
-            ans = str(raw_ans).strip().lower()
-            if ans in ["not applicable", r"not\ applicable"]:
+            ans = "" if raw_ans is None else str(raw_ans).strip().lower()
+            if ans == "not applicable":
                 not_applicable_count += 1
-                continue
-            if ans in ["yes", "no"]:
-                valid_count += 1
-                if ans == "yes":
-                    yes_count += 1
+            elif ans == "yes":
+                yes_count += 1
 
         if valid_count == 0 or cls_total == 0:
             cls_score = 0.0
         else:
-            # Evenly distribute the class score to all applicable items
+            # 在该类别的全部条目之间平均分配分数。
             cls_score = cls_total * yes_count / valid_count
 
         class_info[cls_id] = {
@@ -363,5 +359,4 @@ if __name__ == "__main__":
         output_path=args.output_path,
         print_summary=True,
     )
-
 

@@ -23,6 +23,18 @@ SCORE_FILE_PATTERN = re.compile(
 JSON_SCORE_FILE_PATTERN = re.compile(
     r"^(?P<judge_model>.+)_(?P<ts>\d{8}_\d{6})_score(?:\.json)?$"
 )
+_INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]+')
+
+
+def model_filename_prefix(model: str, thinking_level: str | None = None) -> str:
+    """将模型名转换为跨平台安全、与评测输出一致的文件名前缀。"""
+    base = model.replace('\\', '/').rsplit('/', 1)[-1].strip()
+    base = _INVALID_FILENAME_CHARS.sub('-', base).strip(' .-') or 'model'
+    if thinking_level:
+        safe_level = _INVALID_FILENAME_CHARS.sub('-', thinking_level).strip(' .-')
+        if safe_level:
+            base += f'_{safe_level}'
+    return base
 
 
 # Define all YAML-based scoring metrics:
@@ -118,12 +130,13 @@ def find_all_score_yamls(results_dir: Path, judge_model: str | None = None) -> L
     Returns:
         Matching files, sorted by file name.
     """
+    expected_model = model_filename_prefix(judge_model) if judge_model is not None else None
     matches: List[Path] = []
     for p in results_dir.glob("*_score.yaml"):
         if m := SCORE_FILE_PATTERN.match(p.name):
             # If judge_model is specified, it must match.
-            if judge_model is not None:
-                if m.group("judge_model") == judge_model:
+            if expected_model is not None:
+                if m.group("judge_model") == expected_model:
                     matches.append(p)
             else:
                 # If judge_model is not specified, keep all matches.
@@ -131,13 +144,13 @@ def find_all_score_yamls(results_dir: Path, judge_model: str | None = None) -> L
     return sorted(matches)
 
 
-def find_single_score_yaml(results_dir: Path, prefer_newest: bool, judge_model: str | None = None) -> Path | None:
+def find_single_score_yaml(results_dir: Path, prefer_newest: bool = True, judge_model: str | None = None) -> Path | None:
     """
     Find a single {judge_model}_{timestamp}_score.yaml file in results_dir.
     
     Args:
         results_dir: Results directory.
-        prefer_newest: If multiple files exist, True selects newest, False selects oldest.
+        prefer_newest: If multiple files exist, True selects newest, False selects oldest. Defaults to True.
         judge_model: Optional judge model name; if provided, only consider matching files.
     
     Returns:
@@ -179,14 +192,15 @@ def find_all_score_jsons(results_dir: Path, judge_model: str | None = None) -> L
     Returns:
         Matching files, sorted by file name.
     """
+    expected_model = model_filename_prefix(judge_model) if judge_model is not None else None
     matches: List[Path] = []
     for p in results_dir.iterdir():
         if not p.is_file():
             continue
         if m := JSON_SCORE_FILE_PATTERN.match(p.name):
             # If judge_model is specified, it must match.
-            if judge_model is not None:
-                if m.group("judge_model") == judge_model:
+            if expected_model is not None:
+                if m.group("judge_model") == expected_model:
                     matches.append(p)
             else:
                 # If judge_model is not specified, keep all matches.

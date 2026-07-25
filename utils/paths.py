@@ -59,6 +59,8 @@ DATA_SOURCE_DIRS_REL = [
 
 DATA_SOURCE_DIRS_REL = [Path(rel) for rel in DATA_SOURCE_DIRS_REL]
 
+SKIP_NAMES = {"__pycache__"}
+
 
 def get_data_source_dirs(base_dir: PathLike | None = None) -> list[Path]:
     """
@@ -99,7 +101,7 @@ def get_valid_item_dirs(src_dir: Path, skip_names: set[str] | None = None) -> li
         OSError: If the directory cannot be read.
     """
     if skip_names is None:
-        skip_names = set()
+        skip_names = SKIP_NAMES
     
     return [
         p
@@ -127,4 +129,3 @@ def get_all_data_item_dirs(base_dir: PathLike | None = None, skip_names: set[str
         all_dirs = [dir.relative_to(base_dir) for dir in all_dirs]
     
     return all_dirs
-

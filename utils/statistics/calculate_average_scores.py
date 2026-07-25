@@ -33,6 +33,7 @@ from utils.score_utils import (
     find_single_score_json,
     extract_yaml_metric, 
     extract_ppteval_score,
+    model_filename_prefix,
     YAML_METRIC_SPECS
 )
 
@@ -440,10 +441,14 @@ def process_scoring_method(
     
     # Determine output file name.
     if output_file is None:
-        if scoring_method == 'ours':
-            output_file_path = result_root_dir / "average_scores.yaml"
+        base_name = "average_scores" if scoring_method == 'ours' else "average_scores_ppteval"
+        if judge_model:
+            # 将模型名转换为跨平台安全的文件名片段，避免不同 judge 互相覆盖。
+            safe_judge_model = model_filename_prefix(judge_model)
+            file_name = f"{base_name}__{safe_judge_model}.yaml" if safe_judge_model else f"{base_name}.yaml"
         else:
-            output_file_path = result_root_dir / "average_scores_ppteval.yaml"
+            file_name = f"{base_name}.yaml"
+        output_file_path = result_root_dir / file_name
     else:
         output_file_path = result_root_dir / output_file
     
@@ -584,7 +589,7 @@ def main():
             'ours', 
             args.prefer_newest, 
             args.judge_model,
-            'average_scores.yaml',
+            output_file=None,
             include_leaf_nodes=args.include_leaf_nodes,
         )
     
@@ -594,7 +599,7 @@ def main():
             'ppteval', 
             args.prefer_newest, 
             args.judge_model,
-            'average_scores_ppteval.yaml',
+            output_file=None,
             include_leaf_nodes=args.include_leaf_nodes,
         )
 

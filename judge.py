@@ -36,10 +36,47 @@ from utils.pptx_to_pdf import convert_pptx_to_pdf
 from utils.count_pages import count_pages
 from utils.truncate_pages import truncate_slides
 from utils.judge_utils import find_resume_yaml, load_judge_prompt, is_result_complete, load_existing_results
+from utils.score_utils import model_filename_prefix
 from functools import partial
 
 if TYPE_CHECKING:
     from typing import Protocol
+
+
+logger = logging.getLogger(__name__)
+
+
+_LATEX_WRAPPER_RE = re.compile(r'\\[a-zA-Z]+\s*')
+
+
+def _normalize_boxed_token(raw: str) -> str:
+    """将 boxed 内容中的常见 LaTeX 包装归一化为答案词。"""
+    token = _LATEX_WRAPPER_RE.sub('', raw.strip())
+    token = token.replace('{', '').replace('}', '')
+    return token.strip().strip('.').strip().lower()
+
+
+def _extract_boxed_verdict(response_text: str) -> str | None:
+    """提取最后一个合法 boxed 判定，并支持内部嵌套花括号。"""
+    candidates: list[str] = []
+    for match in re.finditer(r'\\boxed\s*\{', response_text):
+        depth = 1
+        index = match.end()
+        start = index
+        while index < len(response_text) and depth > 0:
+            if response_text[index] == '{':
+                depth += 1
+            elif response_text[index] == '}':
+                depth -= 1
+            index += 1
+        if depth == 0:
+            candidates.append(response_text[start:index - 1])
+
+    for candidate in reversed(candidates):
+        verdict = _normalize_boxed_token(candidate)
+        if verdict in {'yes', 'no', 'not applicable'}:
+            return verdict
+    return None
 
 
 
@@ -109,7 +146,11 @@ def create_judge_api(api_type: str) -> JudgeAPI:
             "MINIMAX_BASE_URL",
             "https://api.minimaxi.com/v1/chat/completions"
         )
-        api_client = OpenAIChatAPI(api_key=api_key, base_url=base_url)
+        api_client = OpenAIChatAPI(
+            api_key=api_key,
+            base_url=base_url,
+            reasoning_split=True,
+        )
     else:
         raise ValueError(f"Unsupported API type: {api_type}")
 
@@ -272,9 +313,9 @@ def process_single_item(item_info, context: JudgeContext):
                 logging.info(f"{response_text=}")
                 logging.info('====================================\n\n')
 
-                # Extract the content inside \boxed{...} from the response text.
-                if match := re.search(r'\\boxed\{([^}]+)\}', response_text):
-                    answer = match.group(1).strip()
+                # 提取最后一个合法判定，避免示例或推理中的 boxed 内容抢先匹配。
+                if verdict := _extract_boxed_verdict(response_text):
+                    answer = verdict
                     break  # Match succeeded -> exit retry loop.
             except Exception as e:
                 # Other unexpected exceptions.
@@ -451,14 +492,6 @@ def main(args=None):
     Args:
         args: Optional argparse.Namespace. If None, parse from command line.
     """
-    # Configure logging.
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
-    )
-    logger = logging.getLogger(__name__)
-
     # Load environment variables from .env.
     load_dotenv()
     if args is None:
@@ -476,8 +509,7 @@ def main(args=None):
             output_dir = os.path.dirname(args.slides) or '.'
             timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
             filename = (
-                args.model +
-                (f'_{args.thinking_level}' if args.thinking_level else '') +
+                model_filename_prefix(args.model, args.thinking_level) +
                 f'_{timestamp}' + '_score'
                 '.yaml'
             )
@@ -610,7 +642,7 @@ def main(args=None):
         _default_output_dir = os.path.dirname(args.output) or '.'
     else:
         _default_output_dir = os.path.dirname(args.slides) or '.'
-    _filename_prefix = args.model + (f'_{args.thinking_level}' if args.thinking_level else '') + '_'
+    _filename_prefix = model_filename_prefix(args.model, args.thinking_level) + '_'
 
     # Parse min_timestamp (if provided).
     min_timestamp = None
@@ -662,8 +694,7 @@ def main(args=None):
             output_dir = os.path.dirname(args.slides) or '.'
             timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
             filename = (
-                args.model +
-                (f'_{args.thinking_level}' if args.thinking_level else '') +
+                model_filename_prefix(args.model, args.thinking_level) +
                 f'_{timestamp}'
                 '.yaml'
             )
@@ -767,4 +798,9 @@ def main(args=None):
 
 
 if __name__ == '__main__':
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+    )
     main()

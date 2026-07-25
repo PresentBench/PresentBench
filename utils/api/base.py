@@ -4,7 +4,13 @@ import os
 import time
 import requests
 from google import genai
-from utils.encode_file import encode_file_base64, read_file_bytes
+from utils.encode_file import build_file_data_url, encode_file_base64, read_file_bytes
+
+
+_TRANSIENT_REQUEST_EXCEPTIONS = (
+    requests.exceptions.Timeout,
+    requests.exceptions.ConnectionError,
+)
 
 
 
@@ -151,9 +157,16 @@ class OpenAIChatAPI(BaseAPI):
     适用于所有兼容 /v1/chat/completions 格式的 API（MiniMax、DeepSeek 等）。
     """
 
-    def __init__(self, api_key: str, base_url: str, **kwargs):
+    def __init__(
+        self,
+        api_key: str,
+        base_url: str,
+        reasoning_split: bool = False,
+        **kwargs,
+    ):
         self.api_key = api_key
         self.base_url = base_url.rstrip('/')
+        self.reasoning_split = reasoning_split
         self.session = requests.Session()
 
     @property
@@ -302,10 +315,11 @@ class OpenAIChatAPI(BaseAPI):
                 }
             ],
             "stream": False,
-            # 让 MiniMax 把思考内容拆到 reasoning_content 字段，
-            # 便于我们之后做 prompt / answer 分离的解析。
-            "reasoning_split": True,
         }
+
+        if self.reasoning_split:
+            # 该字段是 MiniMax 扩展，通用兼容端点默认不发送。
+            data["reasoning_split"] = True
 
         if thinking_level:
             if thinking_level in ("disabled", "adaptive"):
@@ -317,18 +331,30 @@ class OpenAIChatAPI(BaseAPI):
         try:
             last_err: Exception | None = None
             for attempt in range(6):
-                response = self.session.post(self.base_url, headers=self.headers, json=data, timeout=300)
+                try:
+                    response = self.session.post(self.base_url, headers=self.headers, json=data, timeout=300)
+                except _TRANSIENT_REQUEST_EXCEPTIONS as error:
+                    last_err = error
+                    if attempt < 5:
+                        sleep_s = min(60.0, 4.0 * (2 ** attempt))
+                        logging.warning(
+                            f"Chat API transport error on attempt {attempt + 1}: {error}; "
+                            f"sleeping {sleep_s:.1f}s then retrying"
+                        )
+                        time.sleep(sleep_s)
+                    continue
                 if response.status_code == 429 or response.status_code >= 500:
-                    # 限流 / 5xx：长退避，最长 60s
-                    sleep_s = min(60.0, 4.0 * (2 ** attempt))
-                    logging.warning(
-                        f"Chat API transient {response.status_code} on attempt {attempt + 1}; "
-                        f"sleeping {sleep_s:.1f}s then retrying"
-                    )
                     last_err = requests.exceptions.HTTPError(
                         f"{response.status_code} {response.text[:200]}"
                     )
-                    time.sleep(sleep_s)
+                    if attempt < 5:
+                        # 限流 / 5xx：长退避，最长 60 秒；最后一次失败后不再等待。
+                        sleep_s = min(60.0, 4.0 * (2 ** attempt))
+                        logging.warning(
+                            f"Chat API transient {response.status_code} on attempt {attempt + 1}; "
+                            f"sleeping {sleep_s:.1f}s then retrying"
+                        )
+                        time.sleep(sleep_s)
                     continue
                 if response.status_code >= 400:
                     # 4xx 非 429：把 body 打全，便于诊断
@@ -371,6 +397,62 @@ class OpenAIResponsesAPI(BaseAPI):
     def upload_file(self, file_path: str):
         return file_path
 
+    @staticmethod
+    def _extract_output_text(result: dict) -> str:
+        """从 Responses API 的消息与推理项中提取全部纯文本。"""
+        if not isinstance(result, dict):
+            return ''
+
+        segments: list[str] = []
+
+        def add_section(header: str, body: str) -> None:
+            body = body.strip('\n')
+            if body:
+                segments.append(f"--- {header} ---\n{body}")
+
+        def extract_content(content) -> str:
+            if isinstance(content, str):
+                return content
+            if not isinstance(content, list):
+                return ''
+            parts: list[str] = []
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get('type') in ('output_text', 'text'):
+                    text = part.get('text')
+                    if isinstance(text, str) and text:
+                        parts.append(text)
+                elif part.get('type') == 'refusal':
+                    refusal = part.get('refusal')
+                    if isinstance(refusal, str) and refusal:
+                        parts.append(f"[refusal] {refusal}")
+            return '\n'.join(parts)
+
+        for item in result.get('output') or []:
+            if not isinstance(item, dict):
+                continue
+            if item.get('type') == 'message':
+                add_section('message', extract_content(item.get('content')))
+            elif item.get('type') == 'reasoning':
+                parts: list[str] = []
+                for summary in item.get('summary') or []:
+                    if isinstance(summary, dict) and summary.get('type') == 'summary_text':
+                        text = summary.get('text')
+                        if isinstance(text, str) and text:
+                            parts.append(f"[summary] {text}")
+                for content in item.get('content') or []:
+                    if isinstance(content, dict) and content.get('type') == 'reasoning_text':
+                        text = content.get('text')
+                        if isinstance(text, str) and text:
+                            parts.append(text)
+                add_section('reasoning', '\n'.join(parts))
+
+        if segments:
+            return '\n\n'.join(segments)
+        output_text = result.get('output_text')
+        return output_text if isinstance(output_text, str) else ''
+
     def generate_content(self, model: str, prompt: str, file_paths: list = None, **kwargs):
         file_paths = file_paths or []
 
@@ -379,7 +461,7 @@ class OpenAIResponsesAPI(BaseAPI):
             content_list.append({
                 "type": "input_file",
                 "filename": file_path,
-                "file_data": f"data:application/pdf;base64,{encode_file_base64(file_path)}"
+                "file_data": build_file_data_url(file_path),
             })
 
         content_list.append({
@@ -399,17 +481,43 @@ class OpenAIResponsesAPI(BaseAPI):
         }
 
         try:
-            response = self.session.post(self.url, headers=self.headers, json=data, timeout=300)
-            response.raise_for_status()
+            last_error: Exception | None = None
+            for attempt in range(6):
+                try:
+                    response = self.session.post(self.url, headers=self.headers, json=data, timeout=300)
+                except _TRANSIENT_REQUEST_EXCEPTIONS as error:
+                    last_error = error
+                    if attempt < 5:
+                        sleep_seconds = min(60.0, 4.0 * (2 ** attempt))
+                        logging.warning(
+                            f"Responses API transport error on attempt {attempt + 1}: {error}; "
+                            f"sleeping {sleep_seconds:.1f}s then retrying"
+                        )
+                        time.sleep(sleep_seconds)
+                    continue
+                if response.status_code == 429 or response.status_code >= 500:
+                    last_error = requests.exceptions.HTTPError(
+                        f"{response.status_code} {response.text[:200]}"
+                    )
+                    if attempt < 5:
+                        sleep_seconds = min(60.0, 4.0 * (2 ** attempt))
+                        logging.warning(
+                            f"Responses API transient {response.status_code} on attempt {attempt + 1}; "
+                            f"sleeping {sleep_seconds:.1f}s then retrying"
+                        )
+                        time.sleep(sleep_seconds)
+                    continue
 
-            result = response.json()
-            text = result.get('output', [{}])[0].get('content', [{}])[0].get('text', '')
+                response.raise_for_status()
+                result = response.json()
+                return self._extract_output_text(result), result
 
-            return text, result
+            if last_error:
+                logging.error(f"OpenAI Responses API request failed after retries: {last_error}")
+            return None, None
         except requests.exceptions.RequestException as e:
             logging.error(f"OpenAI Responses API request failed: {str(e)}")
             return None, None
         except Exception as e:
             logging.error(f"OpenAI Responses API call failed: {str(e)}")
             return None, None
-

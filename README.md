@@ -60,6 +60,18 @@ conda activate presentbench
 pip install -r requirements.txt
 ```
 
+PDF rendering uses `pdftoppm` when available, then falls back to PyMuPDF and
+finally `pdf2image`. PyMuPDF avoids a hard system dependency, while both
+`pdftoppm` and `pdf2image` require [Poppler](https://poppler.freedesktop.org/):
+
+```bash
+# Ubuntu / Debian
+sudo apt-get install poppler-utils
+
+# macOS (Homebrew)
+brew install poppler
+```
+
 
 ### 2. Download the Benchmark Dataset
 
