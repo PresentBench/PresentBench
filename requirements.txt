@@ -9,4 +9,5 @@ pandas
 huggingface_hub
 python-dotenv
 pypdf
-
+pymupdf
+pdf2image

@@ -1,5 +1,5 @@
 from typing import Optional, Any, List
-from .base import BaseAPI, GeminiAPI, OpenAIAPI, GeminiInlineAPI
+from .base import BaseAPI, GeminiAPI, GeminiInlineAPI, OpenAIChatAPI, OpenAIResponsesAPI
 
 
 
@@ -22,7 +22,10 @@ class JudgeAPI:
         self.api_client = api_client
         # Determine API type at init time to avoid runtime isinstance checks.
         self._is_gemini_api = isinstance(api_client, (GeminiAPI, GeminiInlineAPI))
-        self._is_openai_api = isinstance(api_client, OpenAIAPI)
+        self._is_openai_api = isinstance(
+            api_client,
+            (OpenAIChatAPI, OpenAIResponsesAPI),
+        )
         
         if not self._is_gemini_api and not self._is_openai_api:
             raise ValueError(f"Unsupported API client: {type(api_client)}")
@@ -100,6 +103,7 @@ class JudgeAPI:
                 model=model,
                 prompt=prompt,
                 file_paths=file_paths,
+                thinking_level=thinking_level,
                 **kwargs
             )
         
