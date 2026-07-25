@@ -1,5 +1,6 @@
 import logging
 import os
+import tempfile
 import time
 from abc import ABC, abstractmethod
 
@@ -234,6 +235,7 @@ class OpenAIChatAPI(BaseAPI):
             ) from error
 
         import base64
+        import binascii
         import hashlib
 
         try:
@@ -243,15 +245,28 @@ class OpenAIChatAPI(BaseAPI):
         cache_key = hashlib.sha1(
             f"{pdf_path}|{mtime}|{dpi}|{max_pages}".encode()
         ).hexdigest()[:16]
-        cache_path = os.path.join("/tmp", f"openai_chat_pdf_{cache_key}.tsv")
+        cache_name = f"openai_chat_pdf_v2_{cache_key}.tsv"
+        cache_dir = tempfile.gettempdir()
+        cache_path = os.path.join(cache_dir, cache_name)
 
         rendered: list[bytes] = []
         if os.path.exists(cache_path):
-            with open(cache_path, "r", encoding="utf-8") as cache_file:
-                for line in cache_file:
-                    encoded = line.rstrip("\n")
-                    if encoded:
-                        rendered.append(base64.b64decode(encoded))
+            try:
+                with open(cache_path, "r", encoding="utf-8") as cache_file:
+                    for line in cache_file:
+                        encoded = line.rstrip("\n")
+                        if encoded:
+                            rendered.append(
+                                base64.b64decode(encoded, validate=True)
+                            )
+                if not rendered:
+                    raise ValueError("PDF cache is empty")
+            except (OSError, ValueError, binascii.Error):
+                rendered = []
+                try:
+                    os.unlink(cache_path)
+                except FileNotFoundError:
+                    pass
 
         if not rendered:
             matrix = fitz.Matrix(dpi / 72.0, dpi / 72.0)
@@ -260,9 +275,29 @@ class OpenAIChatAPI(BaseAPI):
                     page = document.load_page(page_index)
                     pixmap = page.get_pixmap(matrix=matrix, alpha=False)
                     rendered.append(pixmap.tobytes("png"))
-            with open(cache_path, "w", encoding="utf-8") as cache_file:
-                for png_bytes in rendered:
-                    cache_file.write(base64.b64encode(png_bytes).decode("utf-8") + "\n")
+
+            temporary_path = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    encoding="utf-8",
+                    dir=cache_dir,
+                    prefix=f".{cache_name}.",
+                    suffix=".tmp",
+                    delete=False,
+                ) as cache_file:
+                    temporary_path = cache_file.name
+                    for png_bytes in rendered:
+                        encoded = base64.b64encode(png_bytes).decode("utf-8")
+                        cache_file.write(encoded + "\n")
+                os.replace(temporary_path, cache_path)
+                temporary_path = None
+            finally:
+                if temporary_path is not None:
+                    try:
+                        os.unlink(temporary_path)
+                    except FileNotFoundError:
+                        pass
 
         return [
             {

@@ -1,8 +1,12 @@
 import base64
+import hashlib
+import os
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import requests
 
@@ -146,6 +150,151 @@ class OpenAIResponsesAPITest(unittest.TestCase):
 
 
 class OpenAIChatAPITest(unittest.TestCase):
+    @staticmethod
+    def _pdf_cache_path(
+        temp_dir: str,
+        pdf_path: Path,
+        max_pages: int = 30,
+        dpi: int = 72,
+    ) -> Path:
+        cache_key = hashlib.sha1(
+            f"{pdf_path}|{pdf_path.stat().st_mtime}|{dpi}|{max_pages}".encode()
+        ).hexdigest()[:16]
+        return Path(temp_dir) / f"openai_chat_pdf_v2_{cache_key}.tsv"
+
+    def test_legacy_pdf_cache_is_ignored(self):
+        class FakePixmap:
+            def tobytes(self, _output_format):
+                return b"fresh-png"
+
+        class FakePage:
+            def get_pixmap(self, matrix, alpha):
+                self.matrix = matrix
+                self.alpha = alpha
+                return FakePixmap()
+
+        class FakeDocument:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
+            def __len__(self):
+                return 1
+
+            def load_page(self, page_index):
+                self.page_index = page_index
+                return FakePage()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pdf_path = Path(temp_dir) / "slides.pdf"
+            pdf_path.write_bytes(b"pdf")
+            current_cache_path = self._pdf_cache_path(temp_dir, pdf_path)
+            legacy_cache_path = current_cache_path.with_name(
+                current_cache_path.name.replace(
+                    "openai_chat_pdf_v2_", "openai_chat_pdf_", 1
+                )
+            )
+            legacy_cache_path.write_text(
+                base64.b64encode(b"stale-partial-png").decode("utf-8") + "\n",
+                encoding="utf-8",
+            )
+            fitz_module = types.SimpleNamespace(
+                open=lambda _path: FakeDocument(),
+                Matrix=lambda *_args: object(),
+            )
+
+            with (
+                patch.dict(sys.modules, {"fitz": fitz_module}),
+                patch("utils.api.base.tempfile.gettempdir", return_value=temp_dir),
+            ):
+                contents = OpenAIChatAPI._pdf_to_image_contents(str(pdf_path))
+
+            self.assertEqual(
+                base64.b64decode(contents[0]["image_url"]["url"].split(",", 1)[1]),
+                b"fresh-png",
+            )
+            self.assertTrue(current_cache_path.exists())
+
+    def test_pdf_cache_hit_skips_rendering(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pdf_path = Path(temp_dir) / "slides.pdf"
+            pdf_path.write_bytes(b"pdf")
+            cache_path = self._pdf_cache_path(temp_dir, pdf_path)
+            cache_path.write_text(
+                base64.b64encode(b"cached-png").decode("utf-8") + "\n",
+                encoding="utf-8",
+            )
+            fitz_open = Mock(side_effect=AssertionError("不应重新渲染"))
+            fitz_module = types.SimpleNamespace(open=fitz_open, Matrix=Mock())
+
+            with (
+                patch.dict(sys.modules, {"fitz": fitz_module}),
+                patch("utils.api.base.tempfile.gettempdir", return_value=temp_dir),
+            ):
+                contents = OpenAIChatAPI._pdf_to_image_contents(str(pdf_path))
+
+            fitz_open.assert_not_called()
+            self.assertEqual(
+                contents[0]["image_url"]["url"],
+                "data:image/png;base64,"
+                + base64.b64encode(b"cached-png").decode("utf-8"),
+            )
+
+    def test_corrupt_pdf_cache_is_rebuilt_and_published_atomically(self):
+        class FakePixmap:
+            def tobytes(self, output_format):
+                self.output_format = output_format
+                return b"fresh-png"
+
+        class FakePage:
+            def get_pixmap(self, matrix, alpha):
+                self.matrix = matrix
+                self.alpha = alpha
+                return FakePixmap()
+
+        class FakeDocument:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
+            def __len__(self):
+                return 1
+
+            def load_page(self, page_index):
+                self.page_index = page_index
+                return FakePage()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pdf_path = Path(temp_dir) / "slides.pdf"
+            pdf_path.write_bytes(b"pdf")
+            cache_path = self._pdf_cache_path(temp_dir, pdf_path)
+            cache_path.write_text("not-valid-base64\n", encoding="utf-8")
+            fitz_module = types.SimpleNamespace(
+                open=lambda _path: FakeDocument(),
+                Matrix=lambda *_args: object(),
+            )
+
+            with (
+                patch.dict(sys.modules, {"fitz": fitz_module}),
+                patch("utils.api.base.tempfile.gettempdir", return_value=temp_dir),
+                patch("utils.api.base.os.replace", wraps=os.replace) as replace,
+            ):
+                contents = OpenAIChatAPI._pdf_to_image_contents(str(pdf_path))
+
+            replace.assert_called_once()
+            self.assertEqual(
+                base64.b64decode(contents[0]["image_url"]["url"].split(",", 1)[1]),
+                b"fresh-png",
+            )
+            self.assertEqual(
+                base64.b64decode(cache_path.read_text(encoding="utf-8").strip()),
+                b"fresh-png",
+            )
+
     def test_reasoning_split_is_opt_in(self):
         session = _FakeSession([
             _FakeResponse(200, {"choices": [{"message": {"content": "ok"}}]})
