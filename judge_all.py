@@ -15,8 +15,7 @@ import io
 import os
 import sys
 import logging
-from collections.abc import Iterator
-from contextlib import contextmanager
+import subprocess
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -27,63 +26,6 @@ import judge
 
 from utils.paths import get_data_source_dirs, DATA_SOURCE_DIRS_REL
 from utils.material_utils import find_material_files
-from utils.statistics.calculate_average_scores import process_scoring_method
-
-
-logger = logging.getLogger(__name__)
-
-
-@contextmanager
-def _per_case_file_log(log_dir: Path) -> Iterator[Path]:
-    """
-    Attach a per-case FileHandler to the root logger for the duration of the
-    `with` block. Any pre-existing handlers (e.g. the stdout StreamHandler
-    configured at program startup) are preserved, so logs are also visible on
-    the console in single-process/debug mode.
-
-    In multi-process mode, worker processes inherit the root logger state
-    from the parent (under `fork`), or start fresh (under `spawn`); either
-    way, the per-case FileHandler added here is only active inside the
-    `with` block in the current process.
-    """
-    log_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    log_file = log_dir / f"{timestamp}.log"
-
-    handler = logging.FileHandler(str(log_file), encoding="utf-8")
-    handler.setFormatter(
-        logging.Formatter(
-            "%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-        )
-    )
-    handler.setLevel(logging.INFO)
-
-    root_logger = logging.getLogger()
-    root_logger.addHandler(handler)
-    try:
-        yield log_file
-    finally:
-        root_logger.removeHandler(handler)
-        handler.close()
-
-
-@contextmanager
-def _sys_path_prepended(path: str) -> Iterator[None]:
-    """Temporarily prepend `path` to sys.path (no-op if already present)."""
-    added = False
-    if path not in sys.path:
-        sys.path.insert(0, path)
-        added = True
-    try:
-        yield
-    finally:
-        if added:
-            try:
-                sys.path.remove(path)
-            except ValueError:
-                pass
-
 
 
 def _is_data_root_ready(data_root: Path) -> tuple[bool, str]:
@@ -142,7 +84,7 @@ def get_type_name(data_source_dir: Path, data_root: Path) -> str:
     return rel_path.parts[0]
  
 
-def collect_all_test_cases(data_root: Path) -> list[tuple[str, Path]]:
+def collect_all_test_cases(data_root: Path, result_root: Path) -> list[tuple[str, Path]]:
     """
     Collect all test cases that should be evaluated.
     Returns: list of (type_name, base_dir) tuples.
@@ -165,180 +107,28 @@ def collect_all_test_cases(data_root: Path) -> list[tuple[str, Path]]:
             material_files = find_material_files(subdir)
             if not material_files:
                 continue  # No material files -> skip this case.
-            
+
             judge_prompt = subdir / "generation_task" / "judge_prompt.json"
             if not judge_prompt.exists():
                 continue
-            
+
+            # Optional: skip cases whose slides (or slides_generation_failed.txt) are missing
+            # under the agent-under-test result tree. This avoids noisy "Slides not found"
+            # errors when the runner is given a data_root larger than the agent's coverage.
+            # Skipped silently so callers can pass a wide data_root without seeing every
+            # un-judge-able case in the failure summary.
+            rel_path = subdir.relative_to(data_root)
+            agent_slides_dir = result_root / rel_path / "generation_task" / "results"
+            agent_slides = agent_slides_dir / "slides.pdf"
+            if not agent_slides.exists():
+                agent_slides = agent_slides_dir / "slides.pptx"
+            if not agent_slides.exists() and not (agent_slides_dir / "slides_generation_failed.txt").exists():
+                continue  # No slides / failure marker under agent -> skip.
+
             # This is a valid test case.
             test_cases.append((type_name, subdir))
     
     return test_cases
-
-
-def _largest_remainder_allocate(
-    # Items to allocate a quota over, each with an integer "size" (capacity).
-    # List of (key, size) pairs; keys are used only for deterministic tie-breaking.
-    items: list[tuple[str, int]],
-    quota: int,
-) -> dict[str, int]:
-    """
-    Allocate ``quota`` units across ``items`` proportionally to each item's
-    size, using the Hamilton / Largest Remainder Method, with the constraint
-    that no item receives more than its own size (capacity).
-
-    Guarantees:
-    - sum of returned values == quota (as long as 0 <= quota <= sum(sizes))
-    - |alloc[i]/quota - size[i]/total| is minimized subject to capacity
-    - deterministic under ties: earlier ``items`` (lexicographic key order
-      passed by caller) win ties.
-    """
-    total_size = sum(s for _, s in items)
-    if quota <= 0 or total_size <= 0:
-        return {k: 0 for k, _ in items}
-    if quota >= total_size:
-        return {k: s for k, s in items}
-
-    # Initial floor allocation.
-    alloc: dict[str, int] = {}
-    remainders: list[tuple[float, int, str]] = []  # (-remainder, tiebreak_idx, key)
-    allocated = 0
-    for idx, (key, size) in enumerate(items):
-        exact = size * quota / total_size
-        base = int(exact)  # floor
-        # Cap at capacity (shouldn't exceed since quota < total_size, but be safe).
-        base = min(base, size)
-        alloc[key] = base
-        allocated += base
-        remainders.append((-(exact - base), idx, key))
-
-    # Distribute the remainder one by one to items with the largest fractional
-    # part, skipping any that are already at capacity.
-    remaining = quota - allocated
-    # Sort by (-remainder, idx) -> largest remainder first, stable by input order.
-    remainders.sort()
-    i = 0
-    while remaining > 0 and i < len(remainders):
-        _, _, key = remainders[i]
-        i += 1
-        size = dict(items)[key]
-        if alloc[key] < size:
-            alloc[key] += 1
-            remaining -= 1
-
-    # If we still have leftover quota (all picks were capped), loop again
-    # giving one more unit to any item with spare capacity, in input order.
-    if remaining > 0:
-        for key, size in items:
-            while remaining > 0 and alloc[key] < size:
-                alloc[key] += 1
-                remaining -= 1
-            if remaining == 0:
-                break
-
-    return alloc
-
-
-def _stratified_sample_by_subcategory(
-    test_cases: list[tuple[str, Path]],
-    limit: int,
-    data_root: Path,
-) -> list[tuple[str, Path]]:
-    """
-    Two-level stratified sampling that returns EXACTLY ``limit`` cases.
-
-    Directory layout: data_root / <domain> / <subcategory> / <test case>
-    - ``type_name`` in each tuple is the domain (first-level category).
-    - The subcategory is the immediate parent directory of the test case dir.
-
-    Priorities (in order):
-    1. Balance across domains:     allocate the ``limit`` quota across the 5
-       domains via the Largest Remainder Method, proportional to each
-       domain's case count.
-    2. Balance across subcategories within each domain: apply the Largest
-       Remainder Method a second time inside each domain, proportional to
-       each subcategory's case count.
-    3. Within each subcategory, pick the first ``k`` cases in dictionary
-       order of path.
-
-    This guarantees ``len(result) == min(limit, total)`` exactly, while
-    keeping inter-domain and intra-domain distributions as balanced as the
-    integer constraints allow. Results are returned sorted by
-    ``(type_name, path)`` for deterministic execution order.
-    """
-    total = len(test_cases)
-    if total == 0 or limit <= 0:
-        return []
-    if limit >= total:
-        return sorted(test_cases, key=lambda tc: (tc[0], str(tc[1])))
-
-    # ---- Group by domain, then by subcategory ----
-    # domain_name -> subcat_key -> list of (type_name, base_dir)
-    domains: dict[str, dict[str, list[tuple[str, Path]]]] = {}
-
-    def _subcat_key(p: Path) -> str:
-        """Path relative to data_root (for stable, human-readable keys)."""
-        try:
-            return str(p.resolve().relative_to(data_root.resolve()))
-        except ValueError:
-            return str(p)
-
-    for type_name, base_dir in test_cases:
-        subcat_dir = base_dir.parent
-        skey = _subcat_key(subcat_dir)
-        domains.setdefault(type_name, {}).setdefault(skey, []).append(
-            (type_name, base_dir)
-        )
-
-    # ---- Level 1: allocate quota across domains ----
-    domain_items: list[tuple[str, int]] = sorted(
-        ((d, sum(len(v) for v in subs.values())) for d, subs in domains.items()),
-        key=lambda x: x[0],
-    )
-    domain_alloc = _largest_remainder_allocate(domain_items, limit)
-
-    # ---- Level 2: within each domain, allocate across subcategories ----
-    sampled: list[tuple[str, Path]] = []
-    for domain, _domain_size in domain_items:
-        d_quota = domain_alloc[domain]
-        if d_quota <= 0:
-            continue
-        subs = domains[domain]
-        subcat_items: list[tuple[str, int]] = sorted(
-            ((skey, len(cases)) for skey, cases in subs.items()),
-            key=lambda x: x[0],
-        )
-        subcat_alloc = _largest_remainder_allocate(subcat_items, d_quota)
-
-        for skey, _subcat_size in subcat_items:
-            k = subcat_alloc[skey]
-            if k <= 0:
-                continue
-            cases = sorted(subs[skey], key=lambda tc: str(tc[1]))
-            sampled.extend(cases[:k])
-
-    return sorted(sampled, key=lambda tc: (tc[0], str(tc[1])))
-
-
-def _invoke_judge(
-    judge_args: argparse.Namespace,
-    log_dir: Path,
-    data_root: Path,
-    error_context: str,
-) -> str | None:
-    """
-    Call `judge.main(judge_args)` with:
-      - a per-case FileHandler attached to the root logger (log_dir/<timestamp>.log),
-      - `data_root` temporarily on sys.path so package-style imports work.
-    Returns None on success, or the stringified error on failure.
-    """
-    with _per_case_file_log(log_dir), _sys_path_prepended(str(data_root)):
-        try:
-            judge.main(args=judge_args)
-            return None
-        except Exception as e:
-            logger.exception("Error when %s: %s", error_context, e)
-            return str(e)
 
 
 def run_once(
@@ -351,20 +141,9 @@ def run_once(
     data_root: Path,
     debug: bool = False,
     min_timestamp: str | None = None,
-    retry: int = 5,
-    temperature: float | None = None,
-    seed: int | None = None,
-    repeats: int = 1,
 ) -> tuple[str, Path, str | None]:
     """
     Run one test case evaluation. Calls `judge.main()`.
-
-    When ``repeats > 1`` the case is evaluated ``repeats`` times, each repeat
-    isolated under ``.../generation_task/results/repeats/<judge_model>/rep{k}``
-    (namespaced per judge so different judge models never collide) so it can be
-    resumed and aggregated independently. ``temperature`` / ``seed`` control the
-    judge's decoding; for repeats the seed is offset per repeat (seed + k - 1)
-    so runs differ yet stay reproducible.
     
     Args:
         api_type: API type.
@@ -380,93 +159,116 @@ def run_once(
         On success, error_message is None; on failure, it contains the error details.
     """
     # Ensure Path objects are absolute (needed for multiprocessing).
-    data_item_dir = Path(data_item_dir).resolve()
-    result_root = Path(result_root).resolve()
-    data_root = Path(data_root).resolve()
+    # Do NOT resolve() symlinks: data/<case> may be a symlink into data_all/...,
+    # and the later relative_to(data_root) would then raise ValueError. The
+    # absolute form is sufficient for os.chdir / sys.path / downstream file IO.
+    data_item_dir = Path(data_item_dir).absolute()
+    result_root = Path(result_root).absolute()
+    data_root = Path(data_root).absolute()
+    
+    # Switch to data_root to ensure relative paths resolve correctly.
+    original_cwd = os.getcwd()
+    try:
+        os.chdir(str(data_root))
 
-    # material and judge_prompt are taken from the data item directory.
-    material_files = find_material_files(data_item_dir)
-    if not material_files:
-        return (type_name, data_item_dir, f"No material files found in {data_item_dir}")
+        def _run_judge_with_logging(judge_args: argparse.Namespace, log_dir: Path, error_context: str) -> str | None:
+            """
+            Shared wrapper: configure logging and call judge.main(); return an error message (None if no error).
+            """
+            log_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            log_file = log_dir / f"{timestamp}.log"
 
-    judge_prompt = data_item_dir / "generation_task" / "judge_prompt.json"
-    # Domain-level common_judge_prompt.json is loaded from data_root by type_name.
-    common_judge_prompt = data_root / type_name / "common_judge_prompt.json"
+            log_handler = logging.FileHandler(str(log_file), encoding="utf-8")
+            log_handler.setFormatter(
+                logging.Formatter("%(asctime)s - %(levelname)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+            )
 
-    # Slides are taken from the agent-under-test directory (same relative layout).
-    rel_path = data_item_dir.relative_to(data_root)
-    agent_slides_dir = result_root / rel_path / "generation_task" / "results"
+            root_logger = logging.getLogger()
+            root_logger.setLevel(logging.INFO)
+            root_logger.handlers.clear()
+            root_logger.addHandler(log_handler)
 
-    # Prefer slides.pdf; fall back to slides.pptx.
-    slides = agent_slides_dir / "slides.pdf"
-    if not slides.exists():
-        slides = agent_slides_dir / "slides.pptx"
+            import sys
 
-    weights_path = data_root / type_name / "judge_weights.yaml"
+            # Ensure data_root is on sys.path so packages like `academia`, `advertising`, etc. are importable.
+            data_root_str = str(data_root)
+            added_to_syspath = False
 
-    # Per-repeat helpers. A single run keeps the historical layout (files
-    # written directly next to slides, output_dir=None); repeats>1 isolates each
-    # repeat under results/.../repeats/<judge_model>/repK. The <judge_model>
-    # level namespaces repeats per judge, so running repeats>1 with different
-    # judge models never collides.
-    repeats = max(1, int(repeats))
-    model_prefix = judge._model_filename_prefix(model, thinking_level)
+            try:
+                if data_root_str not in sys.path:
+                    sys.path.insert(0, data_root_str)
+                    added_to_syspath = True
 
-    def _repeat_output_dir(k: int) -> str | None:
-        if repeats <= 1:
-            return None
-        return str(agent_slides_dir / "repeats" / model_prefix / f"rep{k}")
+                # Call the already-imported judge.main to avoid re-loading the module each time.
+                judge.main(args=judge_args)
+                return None
+            except Exception as e:
+                logging.exception(f"Error when {error_context}: {e}")
+                return str(e)
+            finally:
+                if added_to_syspath and data_root_str in sys.path:
+                    sys.path.remove(data_root_str)
+                root_logger.removeHandler(log_handler)
+                log_handler.close()
+        
+        # material and judge_prompt are taken from the data item directory.
+        material_files = find_material_files(data_item_dir)
+        if not material_files:
+            return (type_name, data_item_dir, f"No material files found in {data_item_dir}")
+        
+        judge_prompt = data_item_dir / "generation_task" / "judge_prompt.json"
+        # Domain-level common_judge_prompt.json is loaded from data_root by type_name.
+        common_judge_prompt = data_root / type_name / "common_judge_prompt.json"
+        
+        # Slides are taken from the agent-under-test directory (same relative layout).
+        # Compute the path relative to data_root.
+        rel_path = data_item_dir.relative_to(data_root)
+        agent_slides_dir = result_root / rel_path / "generation_task" / "results"
+        
+        # Prefer slides.pdf; fall back to slides.pptx.
+        slides = agent_slides_dir / "slides.pdf"
+        if not slides.exists():
+            slides = agent_slides_dir / "slides.pptx"
+        
+        # If slides were not generated but slides_generation_failed.txt exists, write an all-zero score directly.
+        if not slides.exists():
+            failed_flag = agent_slides_dir / "slides_generation_failed.txt"
+            if failed_flag.exists():
+                # Generate an all-zero score file without running evaluation.
+                weights_path = data_root / type_name / "judge_weights.yaml"
 
-    def _repeat_seed(k: int) -> int | None:
-        # Offset the seed per repeat so runs differ yet remain reproducible.
-        # (With temperature=0 some backends stay fully deterministic, in which
-        # case the measured across-repeat variance will simply be ~0.)
-        if seed is None:
-            return None
-        return int(seed) + (k - 1)
+                judge_args = argparse.Namespace(
+                    api_type=api_type,
+                    model=model,
+                    thinking_level=thinking_level,
+                    slides=str(slides),
+                    judge_prompt=str(judge_prompt),
+                    weights_path=str(weights_path),
+                    material=[str(material_file) for material_file in material_files],
+                    output=None,
+                    retry=5,
+                    debug=debug,
+                    zero_score=True,
+                    min_timestamp=min_timestamp,
+                )
 
-    # If slides were not generated but slides_generation_failed.txt exists,
-    # write an all-zero score directly (no evaluation), once per repeat.
-    if not slides.exists():
-        failed_flag = agent_slides_dir / "slides_generation_failed.txt"
-        if not failed_flag.exists():
+                error_msg = _run_judge_with_logging(
+                    judge_args=judge_args,
+                    log_dir=agent_slides_dir / "log",
+                    error_context="writing zero score",
+                )
+                return (type_name, data_item_dir, error_msg)
+
+            # No slides and no failure marker -> keep the original error behavior.
             return (type_name, data_item_dir, f"Slides not found: {slides}")
+        
+        weights_path = data_root / type_name / "judge_weights.yaml"
+        
+        # Log directory lives next to the agent slides output.
+        log_dir = slides.parent / "log"
 
-        errors: list[str] = []
-        for k in range(1, repeats + 1):
-            out_dir = _repeat_output_dir(k)
-            judge_args = argparse.Namespace(
-                api_type=api_type,
-                model=model,
-                thinking_level=thinking_level,
-                slides=str(slides),
-                judge_prompt=str(judge_prompt),
-                weights_path=str(weights_path),
-                material=[str(f) for f in material_files],
-                output=None,
-                output_dir=out_dir,
-                retry=retry,
-                debug=debug,
-                zero_score=True,
-                min_timestamp=min_timestamp,
-                temperature=temperature,
-                seed=_repeat_seed(k),
-            )
-            err = _invoke_judge(
-                judge_args=judge_args,
-                log_dir=(Path(out_dir) if out_dir else agent_slides_dir) / "log",
-                data_root=data_root,
-                error_context=(f"writing zero score (rep{k})" if repeats > 1
-                               else "writing zero score"),
-            )
-            if err:
-                errors.append(f"rep{k}: {err}" if repeats > 1 else err)
-        return (type_name, data_item_dir, "; ".join(errors) if errors else None)
-
-    # Normal path: build argparse.Namespace and invoke judge.main(), per repeat.
-    errors = []
-    for k in range(1, repeats + 1):
-        out_dir = _repeat_output_dir(k)
+        # Build argparse.Namespace to pass into judge.main().
         judge_args = argparse.Namespace(
             api_type=api_type,
             model=model,
@@ -475,118 +277,41 @@ def run_once(
             judge_prompt=str(judge_prompt),
             common_judge_prompt=str(common_judge_prompt),
             weights_path=str(weights_path),
-            material=[str(f) for f in material_files],
-            output=None,  # Use default output path (respecting output_dir).
-            output_dir=out_dir,
-            retry=retry,
+            material=[str(material_file) for material_file in material_files],
+            output=None,  # Use default output path.
+            retry=5,
             debug=debug,  # Allow debug in single-process mode.
             min_timestamp=min_timestamp,
-            temperature=temperature,
-            seed=_repeat_seed(k),
         )
-        err = _invoke_judge(
+
+        error_msg = _run_judge_with_logging(
             judge_args=judge_args,
-            log_dir=(Path(out_dir) if out_dir else slides.parent) / "log",
-            data_root=data_root,
-            error_context=(f"running judge.main (rep{k})" if repeats > 1
-                           else "running judge.main"),
+            log_dir=log_dir,
+            error_context="running judge.main",
         )
-        if err:
-            errors.append(f"rep{k}: {err}" if repeats > 1 else err)
-    return (type_name, data_item_dir, "; ".join(errors) if errors else None)
+        return (type_name, data_item_dir, error_msg)
+    finally:
+        # Restore original working directory.
+        os.chdir(original_cwd)
 
 
 if __name__ == "__main__":
     import argparse
-
-    # Configure root logger once for the main process. Per-case file logs are
-    # additionally attached inside `_run_judge_with_logging` without touching
-    # this stdout handler, so in single-process/debug mode logs are visible
-    # on the console AND written to each case's log file. In multi-process
-    # mode, worker processes start with a fresh (handler-less) root logger,
-    # so only the per-case FileHandler is active there.
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-
+    
     parser = argparse.ArgumentParser(description="Batch evaluation script")
     parser.add_argument("--agent_name", type=str, required=True, help="Name of the agent under test")
-    parser.add_argument("--api_type", type=str, default="gemini", help="API type (gemini, gemini_inline)")
-    parser.add_argument("--model", type=str, default="gemini-3-flash-preview", help="Model name")
+    parser.add_argument("--api_type", type=str, default=os.getenv("JUDGE_API_TYPE", "gemini"), help="API type (gemini, gemini_inline, minimax). Default from JUDGE_API_TYPE env or gemini.")
+    parser.add_argument("--model", type=str, default=os.getenv("JUDGE_MODEL", "gemini-3-flash-preview"), help="Model name (default from JUDGE_MODEL env or gemini-3-flash-preview)")
     parser.add_argument("--thinking_level", type=str, default=None, help="Thinking level")
     parser.add_argument("--data_root", type=str, default=None, help="Data root directory (defaults to the repo's data/ directory)")
     parser.add_argument("--result_root", type=str, default=None, help="Root directory of slides to evaluate (default: [repo_root]/results/agent_name)")
     parser.add_argument("--debug", action="store_true", help="Enable debug mode: call judge.py directly (no subprocess), supports ipdb.set_trace(), etc.")
     parser.add_argument("--max_workers", type=int, default=None, help="Maximum worker processes (default: CPU count; forced to 1 in debug mode)")
     parser.add_argument("--min_timestamp", type=str, default=None, help="Minimum timestamp for resume (format: YYYY-MM-DD_HH-MM-SS). Result files with timestamps older than this time will be skipped.")
-    parser.add_argument("--retry", type=int, default=5, help="Number of retries for each judge item (default: 5)")
-    parser.add_argument(
-        "--repeats",
-        type=int,
-        default=1,
-        help=(
-            "Number of independent judge re-evaluations per case (default: 1). "
-            "When >1, each repeat is written to "
-            "results/.../generation_task/results/repeats/<judge_model>/repK/ "
-            "(namespaced per judge, resumable independently), and results are "
-            "aggregated across repeats with "
-            "mean / std / range via utils.statistics.aggregate_repeats. "
-            "Note: to actually observe variability, use a temperature >0 (or "
-            "simply leave --temperature unset to use the API server default "
-            "decoding); with --temperature 0 the judge is (near-)deterministic "
-            "so the measured std will be ~0."
-        ),
-    )
-    parser.add_argument(
-        "--temperature",
-        type=float,
-        default=None,
-        help=(
-            "Judge sampling temperature. Default: not sent (the API server "
-            "default decoding is used, i.e. the original behaviour). Set to 0 "
-            "for the most reproducible verdicts."
-        ),
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=None,
-        help=(
-            "Base judge random seed, forwarded to backends that support it. "
-            "Default: not sent. For --repeats>1, repeat k uses seed+(k-1)."
-        ),
-    )
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=None,
-        help=(
-            "If set to a positive integer N, run EXACTLY N test cases selected "
-            "by two-level stratified sampling (dataset layout: domain/subcategory/case): "
-            "(1) the N-quota is first allocated across the 5 domains proportional "
-            "to each domain's size (Largest Remainder Method), so domains are as "
-            "balanced as integer constraints allow; (2) each domain's sub-quota is "
-            "then allocated across its subcategories the same way; (3) within each "
-            "subcategory the first k cases in dictionary order are taken. "
-            "Useful for smoke tests. Default: run all cases."
-        ),
-    )
+    parser.add_argument("--allow_partial", action="store_true", help="Allow running when the test case count is less than 238 (useful for evaluating a subset of cases).")
     
     args = parser.parse_args()
-
-    # Resolve effective fixed-decoding settings for the judge. By default
-    # neither temperature nor seed is sent (the API server default decoding is
-    # used, i.e. the original behaviour); pass --temperature/--seed to fix them.
-    eff_temperature = args.temperature
-    eff_seed = args.seed
-    if args.repeats and args.repeats > 1:
-        print(
-            f"Repeated evaluation enabled: repeats={args.repeats}, "
-            f"temperature={eff_temperature}, base seed={eff_seed}"
-        )
-
+    
     # Evaluation data root.
     if args.data_root:
         data_root = Path(args.data_root).expanduser().resolve()
@@ -600,49 +325,26 @@ if __name__ == "__main__":
         _print_data_download_help(data_root)
         sys.exit(1)
 
-    # Collect all test cases.
-    print("Collecting test cases...")
-    test_cases = collect_all_test_cases(data_root)
-    total_found = len(test_cases)
-
-    if total_found != 238:
-        print(f"The number of test cases should be 238, but found {total_found}.")
-        _print_data_download_help(data_root)
-        sys.exit(1)
-
-    print(f"Found {total_found} test cases")
-
-    # Optionally restrict to exactly N cases via two-level stratified sampling.
-    if args.limit is not None:
-        if args.limit <= 0:
-            print(f"--limit must be a positive integer, got {args.limit}", file=sys.stderr)
-            sys.exit(2)
-        if args.limit < total_found:
-            test_cases = _stratified_sample_by_subcategory(
-                test_cases, args.limit, data_root
-            )
-            # Report per-domain allocation for transparency.
-            from collections import Counter
-            per_domain = Counter(tc[0] for tc in test_cases)
-            dist = ", ".join(f"{d}={per_domain[d]}" for d in sorted(per_domain))
-            print(
-                f"--limit={args.limit}: two-level stratified sampling selected "
-                f"exactly {len(test_cases)} case(s) out of {total_found} "
-                f"[per-domain: {dist}]"
-            )
-        else:
-            # Still sort for a deterministic running order.
-            test_cases = sorted(test_cases, key=lambda tc: (tc[0], str(tc[1])))
-            print(f"--limit={args.limit} >= total ({total_found}); running all cases")
-
-    total = len(test_cases)
-
     # Agent-under-test results root.
     if args.result_root:
         result_root = Path(args.result_root).expanduser().resolve()
     else:
         result_root = Path("results").resolve() / args.agent_name
     result_root.mkdir(parents=True, exist_ok=True)
+
+    # Collect all test cases.
+    print("Collecting test cases...")
+    test_cases = collect_all_test_cases(data_root, result_root)
+    total = len(test_cases)
+
+    if total != 238:
+        if not args.allow_partial:
+            print(f"The number of test cases should be 238, but found {total}.")
+            _print_data_download_help(data_root)
+            sys.exit(1)
+        print(f"Found {total} test cases (running with --allow_partial).")
+
+    print(f"Found {total} test cases")
     
     # Determine concurrency.
     if args.debug:
@@ -674,10 +376,6 @@ if __name__ == "__main__":
                         data_root=data_root,
                         debug=args.debug,  # Pass debug flag in single-process mode.
                         min_timestamp=args.min_timestamp,
-                        retry=args.retry,
-                        temperature=eff_temperature,
-                        seed=eff_seed,
-                        repeats=args.repeats,
                     )[2]  # Get error message.
                     if error_msg:
                         failed_cases.append((type_name, base_dir, error_msg))
@@ -704,10 +402,6 @@ if __name__ == "__main__":
                         data_root,
                         False,  # Do not use debug in multi-process mode.
                         args.min_timestamp,
-                        args.retry,
-                        eff_temperature,
-                        eff_seed,
-                        args.repeats,
                     ): (type_name, base_dir)
                     for type_name, base_dir in test_cases
                 }
@@ -727,37 +421,22 @@ if __name__ == "__main__":
                     finally:
                         pbar.update(1)
     if len(failed_cases) == 0:
-        judge_model_filter = judge._model_filename_prefix(args.model, args.thinking_level)
-        if args.repeats and args.repeats > 1:
-            # Repeated evaluation: aggregate across repeats (mean / std / range).
-            print(
-                f"\nAll cases succeeded, aggregating {args.repeats} repeats "
-                f"(mean/std/range, judge_model={judge_model_filter})..."
+        # If all cases succeeded, compute average scores.
+        print("\nAll cases succeeded, calculating average scores...")
+        try:
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "utils.statistics.calculate_average_scores",
+                    "--result_root_dir",
+                    str(result_root),
+                    "--prefer_newest",
+                ],
+                check=True,
             )
-            try:
-                from utils.statistics.aggregate_repeats import aggregate_repeats
-                aggregate_repeats(
-                    result_root=result_root,
-                    judge_model=judge_model_filter,
-                    print_summary=True,
-                )
-            except Exception as e:
-                print(f"Failed to aggregate repeats: {e}", file=sys.stderr)
-        else:
-            # Single run: compute average scores as before.
-            print(
-                f"\nAll cases succeeded, calculating average scores "
-                f"(judge_model={judge_model_filter})..."
-            )
-            try:
-                process_scoring_method(
-                    result_root_dir=result_root,
-                    scoring_method="ours",
-                    prefer_newest=True,
-                    judge_model=judge_model_filter,
-                )
-            except Exception as e:
-                print(f"Failed to calculate average scores: {e}", file=sys.stderr)
+        except subprocess.CalledProcessError as e:
+            print(f"Failed to calculate average scores: {e}", file=sys.stderr)
     
     # Print summary.
     print(f"\n{'='*60}")

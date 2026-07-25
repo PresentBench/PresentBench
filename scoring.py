@@ -77,7 +77,7 @@ def score_section(
 
     Returns:
         total_score: sum over all classes in this section
-        class_info: mapping "class_id" -> {"score": float, "max_score": float, "yes_count": int, "valid_count": int}
+        class_info: mapping "class_id" -> {"score": float, "max_score": float, "yes_count": int, "valid_count": int, "not_applicable_count": int}
     """
     class_info: Dict[str, Dict[str, Any]] = {}
     total_score = 0.0
@@ -91,24 +91,30 @@ def score_section(
         cls_total = float(class_weights.get(cls_id, 0.0))
 
         # Flatten items: keys like "1.1", "1.2", ...
-        # Each item must answer yes/no; the denominator (valid_count) is the
-        # total number of items in the class, so any non-"yes" answer simply
-        # contributes 0 to the numerator (yes_count).
         yes_count = 0
         valid_count = 0
+        not_applicable_count = 0
 
         for item_id, item in cls_answers.items():
             if not isinstance(item, dict):
                 continue
-            valid_count += 1
-            ans = item.get("answer", "").strip().lower()
-            if ans == "yes":
-                yes_count += 1
+            raw_ans = item.get("answer")
+            if raw_ans is None:
+                # API 调用失败：无 answer 视为不计
+                continue
+            ans = str(raw_ans).strip().lower()
+            if ans in ["not applicable", r"not\ applicable"]:
+                not_applicable_count += 1
+                continue
+            if ans in ["yes", "no"]:
+                valid_count += 1
+                if ans == "yes":
+                    yes_count += 1
 
         if valid_count == 0 or cls_total == 0:
             cls_score = 0.0
         else:
-            # Evenly distribute the class score across all items in the class
+            # Evenly distribute the class score to all applicable items
             cls_score = cls_total * yes_count / valid_count
 
         class_info[cls_id] = {
@@ -116,6 +122,7 @@ def score_section(
             "max_score": cls_total,
             "yes_count": yes_count,
             "valid_count": valid_count,
+            "not_applicable_count": not_applicable_count,
         }
         total_score += cls_score
 
@@ -128,6 +135,7 @@ def _compute_section_stats(total: float, max_total: float, class_info: Dict[str,
         "weighted_arithmetic_mean_percent": (total / max_total * 100.0) if max_total > 0 else 0.0,
         "yes_count": _sum_stats(class_info, "yes_count"),
         "valid_count": _sum_stats(class_info, "valid_count"),
+        "not_applicable_count": _sum_stats(class_info, "not_applicable_count"),
     }
 
 
@@ -176,6 +184,7 @@ def compute_scores(result_path: str, weights_path: str) -> Dict[str, Any]:
         "weighted_arithmetic_mean_percent": ((mi_total + md_total) / overall_max_total * 100.0) if overall_max_total > 0 else 0.0,
         "yes_count": mi_stats["yes_count"] + md_stats["yes_count"],
         "valid_count": mi_stats["valid_count"] + md_stats["valid_count"],
+        "not_applicable_count": mi_stats["not_applicable_count"] + md_stats["not_applicable_count"],
         "leave_one_out_analysis": leave_one_out_stats,
     }
     
@@ -214,17 +223,16 @@ def _build_tree_data(scores: Dict[str, Any]) -> Dict[str, Any]:
                     "score_percent": (info["score"] / info["max_score"] * 100.0) if info["max_score"] > 0 else 0.0,
                     "yes_count": info["yes_count"],
                     "valid_count": info["valid_count"],
+                    "not_applicable_count": info["not_applicable_count"],
                 }
                 for cls_id, info in class_info.items()
             },
         }
     
     return {
-        "total": {
-            **scores["total"],
-            "material_independent": _build_section("material_independent"),
-            "material_dependent": _build_section("material_dependent"),
-        }
+        "total": scores["total"],
+        "material_independent": _build_section("material_independent"),
+        "material_dependent": _build_section("material_dependent"),
     }
 
 
@@ -237,7 +245,7 @@ def _print_summary(scores: Dict[str, Any], output_path: str):
         class_ids = sorted(class_info.keys(), key=lambda x: int(x))
         
         print(f"\n{tree_prefix} {section_label} ({section_info['weight_percent']:.0f}%):")
-        print(f"{class_prefix}  ├─ Statistics: {section_info['yes_count']} / {section_info['valid_count']} yes")
+        print(f"{class_prefix}  ├─ Statistics: {section_info['yes_count']} / {section_info['valid_count']} yes, {section_info['not_applicable_count']} NA")
         print(f"{class_prefix}  └─ Weighted arithmetic mean: {section_info['weighted_arithmetic_mean_percent']:.1f}%")
         
         overall_max_total = scores["overall_max_total"]
@@ -257,11 +265,11 @@ def _print_summary(scores: Dict[str, Any], output_path: str):
             else:  # material_dependent
                 prefix = "   └──" if is_last else "   ├──"
             
-            print(f"{prefix} Class {cls_id} ({class_weight_percent:.0f}%): {class_score_percent:.1f}% ({info['yes_count']} / {info['valid_count']} yes)")
+            print(f"{prefix} Class {cls_id} ({class_weight_percent:.0f}%): {class_score_percent:.1f}% ({info['yes_count']} / {info['valid_count']} yes, {info['not_applicable_count']} NA)")
     
     total_info = scores['total']
     print(f"Total")
-    print(f"  ├─ Statistics: {total_info['yes_count']} / {total_info['valid_count']} yes")
+    print(f"  ├─ Statistics: {total_info['yes_count']} / {total_info['valid_count']} yes, {total_info['not_applicable_count']} NA")
     print(f"  └─ Weighted arithmetic mean: {total_info['weighted_arithmetic_mean_percent']:.1f}%")
     
     has_md = len(scores["material_dependent_class_info"]) > 0

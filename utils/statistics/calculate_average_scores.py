@@ -20,7 +20,6 @@ Args:
 """
 
 import argparse
-import re
 from collections import defaultdict
 from pathlib import Path
 
@@ -397,10 +396,6 @@ def format_output(result_tree: dict, scoring_method: str = 'ours') -> dict:
     return format_node(result_tree)
 
 
-###############################
-## API for external use
-###############################
-
 def process_scoring_method(
     result_root_dir: Path,
     scoring_method: str,
@@ -444,23 +439,11 @@ def process_scoring_method(
     formatted_result = format_output(result_tree, scoring_method)
     
     # Determine output file name.
-    # When judge_model is specified, append it as a suffix so that results
-    # from different judge models don't overwrite each other, e.g.
-    #   average_scores__<judge_model>.yaml
-    #   average_scores_ppteval__<judge_model>.yaml
-    # The double underscore keeps the judge_model clearly separable from the
-    # base name even if the base name itself contains underscores.
     if output_file is None:
-        base_name = "average_scores" if scoring_method == 'ours' else "average_scores_ppteval"
-        if judge_model:
-            # Sanitize the judge_model string so it is safe to use as part of
-            # a filename on all common filesystems (replace path separators
-            # and other problematic characters with '-').
-            safe_judge_model = re.sub(r'[^A-Za-z0-9._+-]+', '-', judge_model).strip('-')
-            file_name = f"{base_name}__{safe_judge_model}.yaml" if safe_judge_model else f"{base_name}.yaml"
+        if scoring_method == 'ours':
+            output_file_path = result_root_dir / "average_scores.yaml"
         else:
-            file_name = f"{base_name}.yaml"
-        output_file_path = result_root_dir / file_name
+            output_file_path = result_root_dir / "average_scores_ppteval.yaml"
     else:
         output_file_path = result_root_dir / output_file
     
@@ -595,25 +578,23 @@ def main():
     result_root_dir = Path(args.result_root_dir)
     
     # Process each scoring method.
-    # Pass output_file=None so that process_scoring_method can derive the
-    # default filename, including the judge_model suffix when applicable.
     if 'ours' in args.scoring_methods:
         process_scoring_method(
-            result_root_dir,
-            'ours',
-            args.prefer_newest,
+            result_root_dir, 
+            'ours', 
+            args.prefer_newest, 
             args.judge_model,
-            output_file=None,
+            'average_scores.yaml',
             include_leaf_nodes=args.include_leaf_nodes,
         )
-
+    
     if 'ppteval' in args.scoring_methods:
         process_scoring_method(
-            result_root_dir,
-            'ppteval',
-            args.prefer_newest,
+            result_root_dir, 
+            'ppteval', 
+            args.prefer_newest, 
             args.judge_model,
-            output_file=None,
+            'average_scores_ppteval.yaml',
             include_leaf_nodes=args.include_leaf_nodes,
         )
 

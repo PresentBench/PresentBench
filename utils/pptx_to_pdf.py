@@ -252,11 +252,18 @@ def _convert_with_libreoffice(pptx_path: Path, pdf_path: Optional[Path]) -> Opti
     Returns:
         Path to the generated PDF file, or None if conversion failed
     """
-    # Check if LibreOffice is installed
-    try:
-        subprocess.run(['libreoffice', '--version'], 
-                      capture_output=True, check=True)
-    except (subprocess.CalledProcessError, FileNotFoundError):
+    # Check if LibreOffice is installed (try 'soffice' first, then 'libreoffice')
+    libreoffice_cmd = None
+    for cmd in ['soffice', 'libreoffice']:
+        try:
+            subprocess.run([cmd, '--version'],
+                          capture_output=True, check=True)
+            libreoffice_cmd = cmd
+            break
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            continue
+
+    if libreoffice_cmd is None:
         logger.error("LibreOffice is not installed or not in PATH.")
         logger.error("Please install LibreOffice: sudo apt-get install libreoffice")
         return None
@@ -276,13 +283,8 @@ def _convert_with_libreoffice(pptx_path: Path, pdf_path: Optional[Path]) -> Opti
         # --headless: Run without GUI
         # --convert-to pdf: Convert to PDF
         # --outdir: Output directory (temporary directory)
-        # -env:UserInstallation: Use a dedicated user profile per call so that
-        #   concurrent invocations don't fight for the default ~/.config/libreoffice lock.
-        user_profile_dir = temp_dir_path / 'lo_profile'
-        user_profile_dir.mkdir(parents=True, exist_ok=True)
         cmd = [
-            'libreoffice',
-            f'-env:UserInstallation=file://{user_profile_dir}',
+            libreoffice_cmd,
             '--headless',
             '--convert-to', 'pdf',
             '--outdir', str(temp_dir_path),
@@ -294,8 +296,7 @@ def _convert_with_libreoffice(pptx_path: Path, pdf_path: Optional[Path]) -> Opti
                 cmd,
                 capture_output=True,
                 text=True,
-                check=True,
-                timeout=300,
+                check=True
             )
             
             # LibreOffice creates PDF in the temp directory with the same name as input

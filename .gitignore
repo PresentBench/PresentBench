@@ -1,7 +1,16 @@
+.DS_Store
 trash/
 __pycache__/
 log/
+logs/
 .env
 *.log
 /results
 /data
+/data_sample
+/data_all
+.claude/skills/*
+!.claude/skills/batch-run-pptx-craft/
+/projects
+.playwright-mcp
+tmp_orc

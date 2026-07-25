@@ -3,8 +3,7 @@
 Batch scoring script: traverse all result files under result_root, check completeness, and compute scores.
 
 Usage:
-    python scoring_all.py --result_root ./results/Doubao/  --data_root ./data
-    python scoring_all.py --result_root ./results/Doubao/  --data_root ./data --judge_model gemini-3-flash-preview
+    python scoring_all.py --result_root ./results/Doubao/  --data_root .
 """
 from __future__ import annotations
 
@@ -21,13 +20,6 @@ from scoring import compute_and_save_scores
 from utils.judge_utils import load_judge_prompt, is_result_complete
 from utils.paths import DATA_SOURCE_DIRS_REL, get_data_source_dirs, get_valid_item_dirs, SKIP_NAMES
 
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-)
-
-logger = logging.getLogger(__name__)
 
 def _category_from_rel(rel: str | Path) -> str:
     """Extract category (first-level directory name) from a relative path."""
@@ -61,17 +53,12 @@ def _ensure_data_root_ready(data_root: Path) -> None:
         raise FileNotFoundError("Missing required domain-level files:\n" + "\n".join(missing))
 
 
-def find_result_files(
-    result_root: Path,
-    judge_model: Optional[str] = None,
-) -> tuple[list[tuple[Path, Path, str]], list[tuple[Path, str]]]:
+def find_result_files(result_root: Path) -> tuple[list[tuple[Path, Path, str]], list[tuple[Path, str]]]:
     """
     Find all result files.
     
     Args:
         result_root: Results root directory.
-        judge_model: If specified, only consider result files from this judge model.
-            If None, all judge models are considered and the latest timestamp wins.
         
     Returns:
         (result_files, errors)
@@ -95,7 +82,7 @@ def find_result_files(
         try:
             result_item_dirs = get_valid_item_dirs(src_dir, skip_names=SKIP_NAMES)
         except OSError as e:
-            logger.warning(f"Cannot list directory {src_dir}: {e}")
+            logging.warning(f"Cannot list directory {src_dir}: {e}")
             continue
         
         for result_item_dir in sorted(result_item_dirs, key=lambda p: p.name):
@@ -127,27 +114,18 @@ def find_result_files(
                     if not match:
                         continue
 
-                    model_name = match.group(1)
                     ts = match.group(2)  # "YYYY-MM-DD_HH-MM-SS" (fixed width; string compare works)
-
-                    # If judge_model is specified, only consider files from that model.
-                    if judge_model is not None and model_name != judge_model:
-                        continue
-
                     if latest is None or ts > latest[0]:
                         latest = (ts, file_path)
 
                 if latest is not None:
                     result_files.append((latest[1], result_item_dir, category))
                 else:
-                    if judge_model is not None:
-                        errors.append((result_item_dir, f"no result yaml file for judge_model='{judge_model}' found in {results_dir}"))
-                    else:
-                        errors.append((result_item_dir, f"no matching result yaml file found in {results_dir}"))
+                    errors.append((result_item_dir, f"no matching result yaml file found in {results_dir}"))
             except OSError as e:
                 error_msg = f"cannot list results directory {results_dir}: {e}"
                 errors.append((result_item_dir, error_msg))
-                logger.warning(error_msg)
+                logging.warning(error_msg)
                 continue
     
     return result_files, errors
@@ -344,14 +322,6 @@ def main():
         action="store_true",
         help="Show verbose output"
     )
-    parser.add_argument(
-        "--judge_model",
-        type=str,
-        default=None,
-        help="Only process result files from this judge model. "
-             "File name format: {judge_model}_{timestamp}.yaml. "
-             "If not specified, all judge models are considered."
-    )
     
     args = parser.parse_args()
     
@@ -365,33 +335,29 @@ def main():
     
     result_root = Path(args.result_root).expanduser().resolve()
     if not result_root.exists():
-        logger.error(f"Result root directory does not exist: {result_root}")
+        logging.error(f"Result root directory does not exist: {result_root}")
         sys.exit(1)
     if not result_root.is_dir():
-        logger.error(f"Result root is not a directory: {result_root}")
+        logging.error(f"Result root is not a directory: {result_root}")
         sys.exit(1)
     
     data_root = Path(args.data_root).expanduser().resolve()
     if data_root is None:
-        logger.error(f"Judge weights root is not specified")
+        logging.error(f"Judge weights root is not specified")
         sys.exit(1)
 
     try:
         _ensure_data_root_ready(data_root)
     except Exception as e:
-        logger.error(str(e))
-        logger.error("If you haven't downloaded the benchmark dataset yet, run:")
-        logger.error(f"  {sys.executable} scripts/download_data.py --repo_id PresentBench/PresentBench")
+        logging.error(str(e))
+        logging.error("If you haven't downloaded the benchmark dataset yet, run:")
+        logging.error(f"  {sys.executable} scripts/download_data.py --repo_id PresentBench/PresentBench")
         sys.exit(1)
     
     # Find all result files.
-    judge_model = args.judge_model
-    if judge_model:
-        logger.info(f"Scanning result files in {result_root} for judge_model='{judge_model}'...")
-    else:
-        logger.info(f"Scanning result files in {result_root} (all judge models)...")
-    result_files, find_errors = find_result_files(result_root, judge_model=judge_model)
-    logger.info(f"Found {len(result_files)} result files to process")
+    logging.info(f"Scanning result files in {result_root}...")
+    result_files, find_errors = find_result_files(result_root)
+    logging.info(f"Found {len(result_files)} result files to process")
     
     # Process each result file.
     success_count = 0
@@ -412,7 +378,7 @@ def main():
         else:
             process_error_count += 1
             process_errors.append((result_item_dir, error_msg))
-            logger.error(f"  ✗ Failed: {error_msg}")
+            logging.error(f"  ✗ Failed: {error_msg}")
     
     # Print summary.
     print(f"\n{'='*60}")

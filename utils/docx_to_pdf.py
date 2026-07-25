@@ -4,21 +4,16 @@ Utility to convert DOCX files to PDF.
 Supports batch conversion of all Press Release files in a specified folder.
 """
 
-import logging
 import os
 from pathlib import Path
-
-
-logger = logging.getLogger(__name__)
-
 
 try:
     from docx2pdf import convert
     USE_DOCX2PDF = True
 except ImportError:
     USE_DOCX2PDF = False
-    logger.warning("docx2pdf is not installed; falling back to LibreOffice CLI if available")
-    logger.warning("Install with: pip install docx2pdf")
+    print("Warning: docx2pdf is not installed; falling back to LibreOffice CLI if available")
+    print("Install with: pip install docx2pdf")
 
 
 def _convert_docx_to_pdf_libreoffice(docx_path, output_dir=None):
@@ -52,16 +47,16 @@ def _convert_docx_to_pdf_libreoffice(docx_path, output_dir=None):
         if result.returncode == 0:
             return True
         else:
-            logger.error(f"LibreOffice conversion failed - {result.stderr}")
+            print(f"Error: LibreOffice conversion failed - {result.stderr}")
             return False
     except FileNotFoundError:
-        logger.error("LibreOffice not found. Please ensure LibreOffice is installed.")
+        print("Error: LibreOffice not found. Please ensure LibreOffice is installed.")
         return False
     except subprocess.TimeoutExpired:
-        logger.error(f"Conversion timed out - {docx_path}")
+        print(f"Error: conversion timed out - {docx_path}")
         return False
     except Exception as e:
-        logger.error(f"{str(e)}")
+        print(f"Error: {str(e)}")
         return False
 
 
@@ -77,7 +72,7 @@ def convert_docx_to_pdf(docx_path, pdf_path=None):
         bool: Whether the conversion succeeded.
     """
     if not os.path.exists(docx_path):
-        logger.error(f"File does not exist - {docx_path}")
+        print(f"Error: file does not exist - {docx_path}")
         return False
     
     if pdf_path is None:
@@ -87,7 +82,7 @@ def convert_docx_to_pdf(docx_path, pdf_path=None):
         if USE_DOCX2PDF:
             # Use docx2pdf library.
             convert(docx_path, pdf_path)
-            logger.info(f"Converted: {os.path.basename(docx_path)} -> {os.path.basename(pdf_path)}")
+            print(f"✓ Converted: {os.path.basename(docx_path)} -> {os.path.basename(pdf_path)}")
             return True
         else:
             # Use LibreOffice.
@@ -99,11 +94,11 @@ def convert_docx_to_pdf(docx_path, pdf_path=None):
                     # Rename to the requested path if needed.
                     if expected_pdf != pdf_path:
                         os.rename(expected_pdf, pdf_path)
-                    logger.info(f"Converted: {os.path.basename(docx_path)} -> {os.path.basename(pdf_path)}")
+                    print(f"✓ Converted: {os.path.basename(docx_path)} -> {os.path.basename(pdf_path)}")
                     return True
             return False
     except Exception as e:
-        logger.error(f"Conversion failed - {docx_path}")
-        logger.error(f"  Details: {str(e)}")
+        print(f"Error: conversion failed - {docx_path}")
+        print(f"  Details: {str(e)}")
         return False
 

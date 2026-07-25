@@ -103,31 +103,17 @@ def convert_pdf_to_images(pdf_path: PathLike, output_dir: Optional[PathLike] = N
                 use_pdftoppm = False
 
         if not use_pdftoppm:
-            # Fallback 1: Use pymupdf (fitz) — no poppler dependency
+            # Fallback: Use pdf2image library if available
             try:
-                import fitz  # pymupdf
-                doc = fitz.open(str(generated_pdf))
-                for i, page in enumerate(doc, 1):
-                    mat = fitz.Matrix(150 / 72, 150 / 72)  # 150 DPI
-                    pix = page.get_pixmap(matrix=mat, alpha=False)
+                from pdf2image import convert_from_path
+                images_pil = convert_from_path(str(generated_pdf), dpi=150)
+                for i, img in enumerate(images_pil, 1):
                     png_file = temp_dir / f'page-{i:03d}.png'
-                    pix.save(str(png_file))
+                    img.save(png_file, 'PNG')
                     png_files.append(png_file)
-                doc.close()
-                logger.info("Using pymupdf for PDF to image conversion")
             except ImportError:
-                logger.info("pymupdf not found, trying pdf2image")
-                # Fallback 2: Use pdf2image library if available
-                try:
-                    from pdf2image import convert_from_path
-                    images_pil = convert_from_path(str(generated_pdf), dpi=150)
-                    for i, img in enumerate(images_pil, 1):
-                        png_file = temp_dir / f'page-{i:03d}.png'
-                        img.save(png_file, 'PNG')
-                        png_files.append(png_file)
-                except ImportError:
-                    logger.error("Neither pymupdf nor pdf2image is available")
-                    return None
+                logger.error("pdf2image library not found")
+                return None
 
         if not png_files:
             logger.error("No PNG images were generated from PDF")
