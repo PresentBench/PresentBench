@@ -19,7 +19,6 @@ API_TYPE="gemini"
 MODEL="gemini-3-flash-preview"
 RETRY=5
 # TEMPERATURE=
-# REPEATS=1
 
 
 ############## Configurations ##############
@@ -60,12 +59,6 @@ for agent_name in ${AGENT_NAMES}; do
         cmd="${cmd} --seed ${SEED}"
     fi
 
-    # If REPEATS is set, run that many re-evaluations per case and aggregate
-    # (mean/std/range across repeats).
-    if [ -n "$REPEATS" ]; then
-        cmd="${cmd} --repeats ${REPEATS}"
-    fi
-
     if [ "$DEBUG" = "1" ]; then
         # Debug mode: add --debug, no redirection (useful for ipdb interaction)
         cmd="${cmd} --debug"
@@ -79,4 +72,3 @@ for agent_name in ${AGENT_NAMES}; do
         eval "${cmd} 2>&1 | tee \"${logfile}\""
     fi
 done
-

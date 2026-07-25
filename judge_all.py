@@ -354,18 +354,10 @@ def run_once(
     retry: int = 5,
     temperature: float | None = None,
     seed: int | None = None,
-    repeats: int = 1,
 ) -> tuple[str, Path, str | None]:
     """
     Run one test case evaluation. Calls `judge.main()`.
 
-    When ``repeats > 1`` the case is evaluated ``repeats`` times, each repeat
-    isolated under ``.../generation_task/results/repeats/<judge_model>/rep{k}``
-    (namespaced per judge so different judge models never collide) so it can be
-    resumed and aggregated independently. ``temperature`` / ``seed`` control the
-    judge's decoding; for repeats the seed is offset per repeat (seed + k - 1)
-    so runs differ yet stay reproducible.
-    
     Args:
         api_type: API type.
         model: Model name.
@@ -404,96 +396,62 @@ def run_once(
 
     weights_path = data_root / type_name / "judge_weights.yaml"
 
-    # Per-repeat helpers. A single run keeps the historical layout (files
-    # written directly next to slides, output_dir=None); repeats>1 isolates each
-    # repeat under results/.../repeats/<judge_model>/repK. The <judge_model>
-    # level namespaces repeats per judge, so running repeats>1 with different
-    # judge models never collides.
-    repeats = max(1, int(repeats))
-    model_prefix = judge._model_filename_prefix(model, thinking_level)
-
-    def _repeat_output_dir(k: int) -> str | None:
-        if repeats <= 1:
-            return None
-        return str(agent_slides_dir / "repeats" / model_prefix / f"rep{k}")
-
-    def _repeat_seed(k: int) -> int | None:
-        # Offset the seed per repeat so runs differ yet remain reproducible.
-        # (With temperature=0 some backends stay fully deterministic, in which
-        # case the measured across-repeat variance will simply be ~0.)
-        if seed is None:
-            return None
-        return int(seed) + (k - 1)
-
     # If slides were not generated but slides_generation_failed.txt exists,
-    # write an all-zero score directly (no evaluation), once per repeat.
+    # write an all-zero score directly (no evaluation).
     if not slides.exists():
         failed_flag = agent_slides_dir / "slides_generation_failed.txt"
         if not failed_flag.exists():
             return (type_name, data_item_dir, f"Slides not found: {slides}")
 
-        errors: list[str] = []
-        for k in range(1, repeats + 1):
-            out_dir = _repeat_output_dir(k)
-            judge_args = argparse.Namespace(
-                api_type=api_type,
-                model=model,
-                thinking_level=thinking_level,
-                slides=str(slides),
-                judge_prompt=str(judge_prompt),
-                weights_path=str(weights_path),
-                material=[str(f) for f in material_files],
-                output=None,
-                output_dir=out_dir,
-                retry=retry,
-                debug=debug,
-                zero_score=True,
-                min_timestamp=min_timestamp,
-                temperature=temperature,
-                seed=_repeat_seed(k),
-            )
-            err = _invoke_judge(
-                judge_args=judge_args,
-                log_dir=(Path(out_dir) if out_dir else agent_slides_dir) / "log",
-                data_root=data_root,
-                error_context=(f"writing zero score (rep{k})" if repeats > 1
-                               else "writing zero score"),
-            )
-            if err:
-                errors.append(f"rep{k}: {err}" if repeats > 1 else err)
-        return (type_name, data_item_dir, "; ".join(errors) if errors else None)
-
-    # Normal path: build argparse.Namespace and invoke judge.main(), per repeat.
-    errors = []
-    for k in range(1, repeats + 1):
-        out_dir = _repeat_output_dir(k)
         judge_args = argparse.Namespace(
             api_type=api_type,
             model=model,
             thinking_level=thinking_level,
             slides=str(slides),
             judge_prompt=str(judge_prompt),
-            common_judge_prompt=str(common_judge_prompt),
             weights_path=str(weights_path),
             material=[str(f) for f in material_files],
-            output=None,  # Use default output path (respecting output_dir).
-            output_dir=out_dir,
+            output=None,
+            output_dir=None,
             retry=retry,
-            debug=debug,  # Allow debug in single-process mode.
+            debug=debug,
+            zero_score=True,
             min_timestamp=min_timestamp,
             temperature=temperature,
-            seed=_repeat_seed(k),
+            seed=seed,
         )
         err = _invoke_judge(
             judge_args=judge_args,
-            log_dir=(Path(out_dir) if out_dir else slides.parent) / "log",
+            log_dir=agent_slides_dir / "log",
             data_root=data_root,
-            error_context=(f"running judge.main (rep{k})" if repeats > 1
-                           else "running judge.main"),
+            error_context="writing zero score",
         )
-        if err:
-            errors.append(f"rep{k}: {err}" if repeats > 1 else err)
-    return (type_name, data_item_dir, "; ".join(errors) if errors else None)
+        return (type_name, data_item_dir, err)
+
+    judge_args = argparse.Namespace(
+        api_type=api_type,
+        model=model,
+        thinking_level=thinking_level,
+        slides=str(slides),
+        judge_prompt=str(judge_prompt),
+        common_judge_prompt=str(common_judge_prompt),
+        weights_path=str(weights_path),
+        material=[str(f) for f in material_files],
+        output=None,
+        output_dir=None,
+        retry=retry,
+        debug=debug,
+        min_timestamp=min_timestamp,
+        temperature=temperature,
+        seed=seed,
+    )
+    err = _invoke_judge(
+        judge_args=judge_args,
+        log_dir=slides.parent / "log",
+        data_root=data_root,
+        error_context="running judge.main",
+    )
+    return (type_name, data_item_dir, err)
 
 
 if __name__ == "__main__":
@@ -523,23 +481,6 @@ if __name__ == "__main__":
     parser.add_argument("--min_timestamp", type=str, default=None, help="Minimum timestamp for resume (format: YYYY-MM-DD_HH-MM-SS). Result files with timestamps older than this time will be skipped.")
     parser.add_argument("--retry", type=int, default=5, help="Number of retries for each judge item (default: 5)")
     parser.add_argument(
-        "--repeats",
-        type=int,
-        default=1,
-        help=(
-            "Number of independent judge re-evaluations per case (default: 1). "
-            "When >1, each repeat is written to "
-            "results/.../generation_task/results/repeats/<judge_model>/repK/ "
-            "(namespaced per judge, resumable independently), and results are "
-            "aggregated across repeats with "
-            "mean / std / range via utils.statistics.aggregate_repeats. "
-            "Note: to actually observe variability, use a temperature >0 (or "
-            "simply leave --temperature unset to use the API server default "
-            "decoding); with --temperature 0 the judge is (near-)deterministic "
-            "so the measured std will be ~0."
-        ),
-    )
-    parser.add_argument(
         "--temperature",
         type=float,
         default=None,
@@ -555,7 +496,7 @@ if __name__ == "__main__":
         default=None,
         help=(
             "Base judge random seed, forwarded to backends that support it. "
-            "Default: not sent. For --repeats>1, repeat k uses seed+(k-1)."
+            "Default: not sent."
         ),
     )
     parser.add_argument(
@@ -581,11 +522,6 @@ if __name__ == "__main__":
     # used, i.e. the original behaviour); pass --temperature/--seed to fix them.
     eff_temperature = args.temperature
     eff_seed = args.seed
-    if args.repeats and args.repeats > 1:
-        print(
-            f"Repeated evaluation enabled: repeats={args.repeats}, "
-            f"temperature={eff_temperature}, base seed={eff_seed}"
-        )
 
     # Evaluation data root.
     if args.data_root:
@@ -677,7 +613,6 @@ if __name__ == "__main__":
                         retry=args.retry,
                         temperature=eff_temperature,
                         seed=eff_seed,
-                        repeats=args.repeats,
                     )[2]  # Get error message.
                     if error_msg:
                         failed_cases.append((type_name, base_dir, error_msg))
@@ -707,7 +642,6 @@ if __name__ == "__main__":
                         args.retry,
                         eff_temperature,
                         eff_seed,
-                        args.repeats,
                     ): (type_name, base_dir)
                     for type_name, base_dir in test_cases
                 }
@@ -728,36 +662,19 @@ if __name__ == "__main__":
                         pbar.update(1)
     if len(failed_cases) == 0:
         judge_model_filter = judge._model_filename_prefix(args.model, args.thinking_level)
-        if args.repeats and args.repeats > 1:
-            # Repeated evaluation: aggregate across repeats (mean / std / range).
-            print(
-                f"\nAll cases succeeded, aggregating {args.repeats} repeats "
-                f"(mean/std/range, judge_model={judge_model_filter})..."
+        print(
+            f"\nAll cases succeeded, calculating average scores "
+            f"(judge_model={judge_model_filter})..."
+        )
+        try:
+            process_scoring_method(
+                result_root_dir=result_root,
+                scoring_method="ours",
+                prefer_newest=True,
+                judge_model=judge_model_filter,
             )
-            try:
-                from utils.statistics.aggregate_repeats import aggregate_repeats
-                aggregate_repeats(
-                    result_root=result_root,
-                    judge_model=judge_model_filter,
-                    print_summary=True,
-                )
-            except Exception as e:
-                print(f"Failed to aggregate repeats: {e}", file=sys.stderr)
-        else:
-            # Single run: compute average scores as before.
-            print(
-                f"\nAll cases succeeded, calculating average scores "
-                f"(judge_model={judge_model_filter})..."
-            )
-            try:
-                process_scoring_method(
-                    result_root_dir=result_root,
-                    scoring_method="ours",
-                    prefer_newest=True,
-                    judge_model=judge_model_filter,
-                )
-            except Exception as e:
-                print(f"Failed to calculate average scores: {e}", file=sys.stderr)
+        except Exception as e:
+            print(f"Failed to calculate average scores: {e}", file=sys.stderr)
     
     # Print summary.
     print(f"\n{'='*60}")
