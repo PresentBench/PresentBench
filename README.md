@@ -60,6 +60,16 @@ conda activate presentbench
 pip install -r requirements.txt
 ```
 
+PDF rendering uses `pdftoppm` when available and otherwise falls back to PyMuPDF, which is installed by `requirements.txt` and needs no system package. Installing [Poppler](https://poppler.freedesktop.org/) enables the faster `pdftoppm` path:
+
+```bash
+# Ubuntu / Debian
+sudo apt-get install poppler-utils
+
+# macOS (Homebrew)
+brew install poppler
+```
+
 
 ### 2. Download the Benchmark Dataset
 

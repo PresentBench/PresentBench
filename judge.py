@@ -31,13 +31,13 @@ from dataclasses import dataclass
 from typing import Optional, List, Any, TYPE_CHECKING, Callable
 from enum import Enum
 
-from utils.api.base import GeminiAPI, GeminiInlineAPI
+from utils.api.base import GeminiAPI, GeminiInlineAPI, OpenAIChatAPI
 from utils.api.judge_api import JudgeAPI
 from utils.pptx_to_pdf import convert_pptx_to_pdf
 from utils.count_pages import count_pages
 from utils.truncate_pages import truncate_slides
 from utils.judge_utils import find_resume_yaml, load_judge_prompt, is_result_complete, load_existing_results
-from utils.score_utils import find_single_score_yaml
+from utils.score_utils import find_single_score_yaml, model_filename_prefix
 from functools import partial
 
 if TYPE_CHECKING:
@@ -95,7 +95,7 @@ def create_judge_api(
         api_client = GeminiInlineAPI(
             api_key=api_key,
             **(
-                dict(http_options={"": os.getenv("GENAI_BASE_URL")})
+                dict(http_options={"base_url": os.getenv("GENAI_BASE_URL")})
                 if os.getenv("GENAI_BASE_URL")
                 else dict()
             ),
@@ -115,6 +115,20 @@ def create_judge_api(
                 else dict()
             ),
         )
+    elif api_type == 'minimax':
+        api_key = os.getenv("MINIMAX_API_KEY")
+        if not api_key:
+            raise ValueError(
+                "MINIMAX_API_KEY environment variable is not set. "
+                "Please configure it in .env file."
+            )
+        api_client = OpenAIChatAPI(
+            api_key=api_key,
+            # API root as MiniMax documents it; use https://api.minimax.io/v1
+            # instead for a global (non-CN) account.
+            base_url=os.getenv("MINIMAX_BASE_URL", "https://api.minimaxi.com/v1"),
+            reasoning_split=True,
+        )
     else:
         raise ValueError(f"Unsupported API type: {api_type}")
     
@@ -123,15 +137,8 @@ def create_judge_api(
 
 
 def _model_filename_prefix(model: str, thinking_level: str | None = None) -> str:
-    """Return the sanitised model name used as a filename prefix.
-
-    Strips any namespace prefix (e.g. ``Qwen/Qwen3.5-122B-A10B`` → ``Qwen3.5-122B-A10B``)
-    and appends the thinking level when provided.
-    """
-    base = model.split('/')[-1]
-    if thinking_level:
-        base += f'_{thinking_level}'
-    return base
+    """Kept for existing callers; delegates to the shared, filename-safe prefix."""
+    return model_filename_prefix(model, thinking_level)
 
 
 # ------------------------------------------------------------------------------
@@ -163,8 +170,8 @@ def parse_args():
     )
     parser.add_argument(
         '--api_type', type=str, required=True,
-        choices=['gemini', 'gemini_inline'],
-        help='API type to use: gemini or gemini_inline'
+        choices=['gemini', 'gemini_inline', 'minimax'],
+        help='API type to use: gemini, gemini_inline, or minimax'
     )
     parser.add_argument(
         '--model', type=str, default='gemini-3-flash-preview',

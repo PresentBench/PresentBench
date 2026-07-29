@@ -1,13 +1,28 @@
 import logging
+import os
+import tempfile
 from abc import ABC, abstractmethod
 
 import requests
 from google import genai
 
-from utils.encode_file import get_mime_type, read_file_bytes, build_file_data_url
+from utils.encode_file import (
+    build_file_data_url,
+    encode_file_base64,
+    get_mime_type,
+    read_file_bytes,
+)
 
 
 logger = logging.getLogger(__name__)
+
+
+def _describe_request_error(error: Exception) -> str:
+    """Append the response body, which is usually what explains an HTTP error."""
+    response = getattr(error, "response", None)
+    if response is not None and response.text:
+        return f"{error}: {response.text[:200]}"
+    return str(error)
 
 
 def _build_gemini_config(thinking_level=None, temperature=None, seed=None):
@@ -162,8 +177,215 @@ class GeminiInlineAPI(BaseAPI):
 
 
 
-class OpenAIAPI(BaseAPI):
-    """OpenAI Response API wrapper."""
+class OpenAIChatAPI(BaseAPI):
+    """Multimodal client for the OpenAI Chat Completions protocol."""
+
+    def __init__(
+        self,
+        api_key: str,
+        base_url: str,
+        reasoning_split: bool = False,
+        pdf_dpi: int = 150,
+        **kwargs,
+    ):
+        self.api_key = api_key
+        # ``base_url`` is the API root (e.g. https://api.minimaxi.com/v1), the
+        # same value OpenAI-compatible SDKs take; the route is appended here.
+        self.base_url = base_url.rstrip('/')
+        self.url = f"{self.base_url}/chat/completions"
+        self.reasoning_split = reasoning_split
+        self.pdf_dpi = pdf_dpi
+        self.session = requests.Session()
+
+    @property
+    def headers(self):
+        return {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+    def upload_file(self, file_path: str):
+        """Chat Completions takes inline content, so keep the local path."""
+        return file_path
+
+    def _build_file_content(self, file_path: str) -> list[dict]:
+        """Convert a local file into Chat Completions multimodal content."""
+        suffix = os.path.splitext(file_path)[1].lower()
+        if suffix == '.pdf':
+            return self._pdf_to_image_contents(file_path, dpi=self.pdf_dpi)
+        if suffix in ('.md', '.txt'):
+            with open(file_path, 'r', encoding='utf-8') as file_obj:
+                return [{"type": "text", "text": file_obj.read()}]
+
+        payload = encode_file_base64(file_path)
+        return [{
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:application/octet-stream;base64,{payload}",
+            },
+        }]
+
+    @staticmethod
+    def _pdf_to_image_contents(pdf_path: str, dpi: int = 150) -> list[dict]:
+        """Render every PDF page to a PNG data URL, cached on disk.
+
+        No page limit is applied: how many slides the judge may see is decided
+        by the benchmark (``judge.py`` truncates slides to the checklist's
+        ``max_count``) and materials are never truncated, so dropping pages
+        here would silently score a different deck than the Gemini backends do.
+        The default DPI matches ``utils.pdf_to_images``, keeping body text
+        legible enough to compare against backends that read the PDF natively.
+        """
+        try:
+            import fitz
+        except ImportError as error:
+            raise ImportError(
+                "pymupdf is required to render PDF pages for OpenAIChatAPI. "
+                "Install with: pip install pymupdf"
+            ) from error
+
+        import base64
+        import binascii
+        import hashlib
+
+        try:
+            mtime = os.path.getmtime(pdf_path)
+        except OSError:
+            mtime = 0
+        cache_key = hashlib.sha1(
+            f"{pdf_path}|{mtime}|{dpi}".encode()
+        ).hexdigest()[:16]
+        # v3: earlier caches may hold a page-limited render, so never reuse them.
+        cache_name = f"openai_chat_pdf_v3_{cache_key}.tsv"
+        cache_dir = tempfile.gettempdir()
+        cache_path = os.path.join(cache_dir, cache_name)
+
+        # Pages are kept base64-encoded end to end: that is both the cache format
+        # and the wire format, so a cache hit needs no re-encoding.
+        encoded_pages: list[str] = []
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path, "r", encoding="utf-8") as cache_file:
+                    for line in cache_file:
+                        encoded = line.rstrip("\n")
+                        if encoded:
+                            base64.b64decode(encoded, validate=True)  # detect corruption
+                            encoded_pages.append(encoded)
+                if not encoded_pages:
+                    raise ValueError("PDF cache is empty")
+            except (OSError, ValueError, binascii.Error):
+                encoded_pages = []
+                try:
+                    os.unlink(cache_path)
+                except FileNotFoundError:
+                    pass
+
+        if not encoded_pages:
+            matrix = fitz.Matrix(dpi / 72.0, dpi / 72.0)
+            with fitz.open(pdf_path) as document:
+                for page_index in range(len(document)):
+                    page = document.load_page(page_index)
+                    pixmap = page.get_pixmap(matrix=matrix, alpha=False)
+                    encoded_pages.append(
+                        base64.b64encode(pixmap.tobytes("png")).decode("utf-8")
+                    )
+
+            temporary_path = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    encoding="utf-8",
+                    dir=cache_dir,
+                    prefix=f".{cache_name}.",
+                    suffix=".tmp",
+                    delete=False,
+                ) as cache_file:
+                    temporary_path = cache_file.name
+                    for encoded in encoded_pages:
+                        cache_file.write(encoded + "\n")
+                os.replace(temporary_path, cache_path)
+                temporary_path = None
+            finally:
+                if temporary_path is not None:
+                    try:
+                        os.unlink(temporary_path)
+                    except FileNotFoundError:
+                        pass
+
+        return [
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64," + encoded},
+            }
+            for encoded in encoded_pages
+        ]
+
+    def generate_content(
+        self,
+        model: str,
+        prompt: str,
+        file_paths: list | None = None,
+        thinking_level: str | None = None,
+        **kwargs,
+    ):
+        """Call a Chat Completions compatible endpoint.
+
+        A failure returns ``(None, None)``; retrying is owned by the caller
+        (``judge.process_single_item``), as it is for the Gemini clients.
+        """
+        content_list: list[dict] = []
+        for file_path in file_paths or []:
+            content_list.extend(self._build_file_content(file_path))
+        content_list.append({"type": "text", "text": prompt})
+
+        data = {
+            "model": model,
+            "messages": [{"role": "user", "content": content_list}],
+            "stream": False,
+        }
+        if self.reasoning_split:
+            data["reasoning_split"] = True
+        if thinking_level:
+            # The protocol only defines "disabled" and "adaptive"; levels borrowed
+            # from other backends (e.g. Gemini's "high") cannot be honoured.
+            thinking_type = thinking_level
+            if thinking_type not in ("disabled", "adaptive"):
+                logger.warning(
+                    "thinking_level=%r is not supported by the Chat Completions "
+                    "protocol; falling back to 'adaptive'",
+                    thinking_level,
+                )
+                thinking_type = "adaptive"
+            data["thinking"] = {"type": thinking_type}
+        for option in ("temperature", "seed"):
+            if kwargs.get(option) is not None:
+                data[option] = kwargs[option]
+
+        try:
+            response = self.session.post(
+                self.url,
+                headers=self.headers,
+                json=data,
+                timeout=300,
+            )
+            response.raise_for_status()
+            result = response.json()
+            choices = result.get('choices') or []
+            if not choices:
+                logger.error("Chat API returned no choices: %s", str(result)[:200])
+                return None, result
+            text = (choices[0].get('message') or {}).get('content', '')
+            return text, result
+        except requests.exceptions.RequestException as error:
+            logger.error("Chat API request failed: %s", _describe_request_error(error))
+            return None, None
+        except Exception as error:
+            logger.error("Chat API call failed: %s", error)
+            return None, None
+
+
+class OpenAIResponsesAPI(BaseAPI):
+    """OpenAI Responses API client."""
     
     def __init__(self, api_key: str, **kwargs):
         self.api_key = api_key
@@ -308,12 +530,14 @@ class OpenAIAPI(BaseAPI):
 
             # Extract text content from the response.
             result = response.json()
-            text = self._extract_output_text(result)
-
-            return text, result
+            return self._extract_output_text(result), result
         except requests.exceptions.RequestException as e:
-            logger.error(f"OpenAI API request failed: {str(e)}")
+            logger.error(f"OpenAI Responses API request failed: {_describe_request_error(e)}")
             return None, None
         except Exception as e:
-            logger.error(f"OpenAI API call failed: {str(e)}")
+            logger.error(f"OpenAI Responses API call failed: {str(e)}")
             return None, None
+
+
+# Keep the former name so existing callers do not break.
+OpenAIAPI = OpenAIResponsesAPI

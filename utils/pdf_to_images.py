@@ -31,7 +31,8 @@ def convert_pdf_to_images(pdf_path: PathLike, output_dir: Optional[PathLike] = N
 
     This uses the same backend strategy as `convert_pptx_to_images`:
     - Prefer `pdftoppm` from poppler-utils if available
-    - Fallback to the `pdf2image` library if installed
+    - Fallback to PyMuPDF
+    - Finally fallback to the `pdf2image` library if installed
 
     Args:
         pdf_path: Path to input PDF file
@@ -97,27 +98,29 @@ def convert_pdf_to_images(pdf_path: PathLike, output_dir: Optional[PathLike] = N
                 png_files = sorted(temp_dir.glob('page-*.png'),
                                    key=lambda x: _extract_slide_number(x.name))
 
-            except subprocess.CalledProcessError as e:
-                logger.warning("pdftoppm failed, trying alternative method")
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+                logger.warning("pdftoppm failed or timed out, trying alternative method")
                 logger.debug(f"  stderr: {e.stderr}")
                 use_pdftoppm = False
 
         if not use_pdftoppm:
-            # Fallback 1: Use pymupdf (fitz) — no poppler dependency
+            # Prefer the pymupdf fallback: it needs no system-level Poppler.
             try:
                 import fitz  # pymupdf
-                doc = fitz.open(str(generated_pdf))
-                for i, page in enumerate(doc, 1):
-                    mat = fitz.Matrix(150 / 72, 150 / 72)  # 150 DPI
-                    pix = page.get_pixmap(matrix=mat, alpha=False)
-                    png_file = temp_dir / f'page-{i:03d}.png'
-                    pix.save(str(png_file))
-                    png_files.append(png_file)
-                doc.close()
+                with fitz.open(str(generated_pdf)) as document:
+                    matrix = fitz.Matrix(150 / 72, 150 / 72)
+                    for i, page in enumerate(document, 1):
+                        pixmap = page.get_pixmap(matrix=matrix, alpha=False)
+                        png_file = temp_dir / f'page-{i:03d}.png'
+                        pixmap.save(str(png_file))
+                        png_files.append(png_file)
                 logger.info("Using pymupdf for PDF to image conversion")
-            except ImportError:
-                logger.info("pymupdf not found, trying pdf2image")
-                # Fallback 2: Use pdf2image library if available
+            except Exception as pymupdf_error:
+                png_files.clear()
+                if isinstance(pymupdf_error, ImportError):
+                    logger.info("pymupdf is not installed, trying pdf2image")
+                else:
+                    logger.warning(f"pymupdf conversion failed, trying pdf2image: {pymupdf_error}")
                 try:
                     from pdf2image import convert_from_path
                     images_pil = convert_from_path(str(generated_pdf), dpi=150)
@@ -126,7 +129,7 @@ def convert_pdf_to_images(pdf_path: PathLike, output_dir: Optional[PathLike] = N
                         img.save(png_file, 'PNG')
                         png_files.append(png_file)
                 except ImportError:
-                    logger.error("Neither pymupdf nor pdf2image is available")
+                    logger.error("pdf2image is not available after pymupdf conversion failed")
                     return None
 
         if not png_files:

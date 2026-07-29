@@ -24,6 +24,29 @@ SCORE_FILE_PATTERN = re.compile(
 JSON_SCORE_FILE_PATTERN = re.compile(
     r"^(?P<judge_model>.+)_(?P<ts>\d{8}_\d{6})_score(?:\.json)?$"
 )
+_INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]+')
+
+
+def model_filename_prefix(model: str, thinking_level: str | None = None) -> str:
+    """Turn a model name into a cross-platform-safe filename prefix."""
+    base = model.replace('\\', '/').rsplit('/', 1)[-1].strip()
+    base = _INVALID_FILENAME_CHARS.sub('-', base).strip(' .-') or 'model'
+    if thinking_level:
+        safe_level = _INVALID_FILENAME_CHARS.sub('-', thinking_level).strip(' .-')
+        if safe_level:
+            base += f'_{safe_level}'
+    return base
+
+
+def _matching_filename_prefixes(model: str) -> set[str]:
+    """Filename prefixes a score file may carry for ``model``.
+
+    Sanitising was introduced after some results had already been written, so
+    the unsanitised prefix (namespace stripped, characters left as-is) is still
+    accepted; otherwise results for models whose name contains a character like
+    ``:`` would become unreadable.
+    """
+    return {model_filename_prefix(model), model.split('/')[-1]}
 
 
 # Define all YAML-based scoring metrics:
@@ -132,9 +155,10 @@ def find_all_score_yamls(
     # Build the set of acceptable judge-model names.
     allowed_models: Optional[set[str]] = None
     if judge_model is not None:
-        allowed_models = {judge_model}
-        if extra_judge_models:
-            allowed_models.update(m for m in extra_judge_models if m)
+        allowed_models = _matching_filename_prefixes(judge_model)
+        for m in extra_judge_models or []:
+            if m:
+                allowed_models |= _matching_filename_prefixes(m)
 
     matches: List[Path] = []
     for p in results_dir.glob("*_score.yaml"):
@@ -215,14 +239,18 @@ def find_all_score_jsons(results_dir: Path, judge_model: str | None = None) -> L
     Returns:
         Matching files, sorted by file name.
     """
+    allowed_models = (
+        _matching_filename_prefixes(judge_model) if judge_model is not None else None
+    )
+
     matches: List[Path] = []
     for p in results_dir.iterdir():
         if not p.is_file():
             continue
         if match := JSON_SCORE_FILE_PATTERN.match(p.name):
             # If judge_model is specified, it must match.
-            if judge_model is not None:
-                if match.group("judge_model") == judge_model:
+            if allowed_models is not None:
+                if match.group("judge_model") in allowed_models:
                     matches.append(p)
             else:
                 # If judge_model is not specified, keep all matches.
